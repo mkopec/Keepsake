@@ -72,6 +72,57 @@ func (pe *Pinentry) ConfirmPresence(prompt string, challengeParam, applicationPa
 	return pe.activeRequest.pendingResult, nil
 }
 
+// Confirm shows a confirmation dialog with the given description and blocks
+// until the user answers or ctx is done. It returns true if the user
+// confirmed. Unlike ConfirmPresence it is meant for CTAP2 requests, where the
+// host waits for a single request instead of polling.
+func (pe *Pinentry) Confirm(ctx context.Context, desc string) (bool, error) {
+	pe.mu.Lock()
+	if pe.activeRequest != nil {
+		pe.mu.Unlock()
+		return false, errors.New("other request already in progress")
+	}
+	pe.activeRequest = &request{}
+	pe.mu.Unlock()
+
+	defer func() {
+		pe.mu.Lock()
+		pe.activeRequest = nil
+		pe.mu.Unlock()
+	}()
+
+	childCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	p, cmd, err := launchPinEntry(childCtx)
+	if err != nil {
+		return false, fmt.Errorf("failed to start pinentry: %w", err)
+	}
+	defer func() {
+		cancel()
+		cmd.Wait()
+	}()
+
+	defer p.Shutdown()
+	p.SetTitle("TPM-FIDO")
+	p.SetPrompt("TPM-FIDO")
+	p.SetDesc(desc)
+
+	promptResult := make(chan error, 1)
+	go func() {
+		promptResult <- p.Confirm()
+	}()
+
+	select {
+	case err := <-promptResult:
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return err == nil, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
 func (pe *Pinentry) prompt(req *request, prompt string) {
 	sendResult := func(r Result) {
 		select {

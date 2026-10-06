@@ -12,9 +12,30 @@ A signing child key is then generated from that primary key. The key handle retu
 
 On an authentication request, tpm-fido will attempt to load the primary key by initializing the hkdf in the same manner as above. It will then attempt to load the child key from the provided key handle. Any incorrect values or values created by a different TPM will fail to load.
 
+### FIDO2 (CTAP2)
+
+tpm-fido speaks both U2F (CTAP1) and CTAP 2.0. The CTAP2 `rpIdHash` is the same value as the U2F application parameter, so CTAP2 credential IDs use the key handle format described above, and credentials registered over U2F keep working over CTAP2.
+
+Supported: `authenticatorMakeCredential` (ES256 only, "packed" self attestation), `authenticatorGetAssertion` and `authenticatorGetInfo`. Not supported yet: discoverable (resident) credentials, clientPIN / user verification, `authenticatorReset` and extensions such as `hmac-secret`.
+
+User presence is confirmed through `pinentry`, with the relying party ID and user name shown in the prompt.
+
+### Signature counter
+
+The signature counter is a TPM NV counter at index `0x0100F1D0` (change it with `-counter-index`). tpm-fido defines the index on first start, which requires the owner hierarchy to have an empty authorization value. The index is an orderly (hybrid) counter, so the TPM doesn't write NV on every signature. After an unclean shutdown the counter jumps forward.
+
+Older versions of tpm-fido reported the number of seconds since 2021-01-01 as the counter. The NV counter value is offset by `0x10000000` so it stays above any of those values.
+
 ## Status
 
 tpm-fido has been tested to work with Chrome and Firefox on Linux.
+
+CTAP2 support has been tested with libfido2 (`fido2-cred`, `fido2-assert`, `fido2-token`) and python-fido2 against swtpm. To run against swtpm:
+
+```
+swtpm socket --tpm2 --tpmstate dir=/tmp/swtpm --server type=unixio,path=/tmp/swtpm/sock --flags not-need-init,startup-clear
+./tpm-fido -device /tmp/swtpm/sock
+```
 
 ## Building
 

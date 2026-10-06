@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math/big"
 	"sync"
-	"time"
 
 	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/tpmutil"
 	"github.com/psanford/tpm-fido/internal/lencode"
 	"golang.org/x/crypto/cryptobyte"
 	"golang.org/x/crypto/cryptobyte/asn1"
@@ -22,27 +23,69 @@ var (
 	seedSizeBytes = 20
 )
 
+// DefaultCounterIndex is the NV index used for the signature counter. It is
+// in the owner range (0x01000000-0x013FFFFF) of the TCG handle registry.
+const DefaultCounterIndex = 0x0100F1D0
+
+// counterOffset is added to the NV counter value. Earlier versions reported
+// the seconds since 2021-01-01 as the signature counter; starting above any
+// value that could have produced (until mid 2029) keeps the counter
+// increasing for existing credentials.
+const counterOffset = 0x10000000
+
+// TPM_NT_COUNTER in the TPM_NT field of TPMA_NV
+const nvTypeCounter tpm2.NVAttr = 0x10
+
+// The counter is a hybrid (orderly) counter so that the TPM only writes it to
+// NV on shutdown instead of on every increment. After an unclean shutdown it
+// jumps forward, which is fine for a signature counter.
+const counterAttrs = nvTypeCounter | tpm2.AttrAuthWrite | tpm2.AttrAuthRead |
+	tpm2.AttrNoDA | tpm2.AttrOrderly
+
 type TPM struct {
-	devicePath string
-	mu         sync.Mutex
+	devicePath   string
+	counterIndex tpmutil.Handle
+	mu           sync.Mutex
 }
 
 func (t *TPM) open() (io.ReadWriteCloser, error) {
 	return tpm2.OpenTPM(t.devicePath)
 }
 
-func New(devicePath string) (*TPM, error) {
+func New(devicePath string, counterIndex uint32) (*TPM, error) {
 	t := &TPM{
-		devicePath: devicePath,
+		devicePath:   devicePath,
+		counterIndex: tpmutil.Handle(counterIndex),
 	}
 
 	tpm, err := t.open()
 	if err != nil {
 		return nil, err
 	}
-	tpm.Close()
+	defer tpm.Close()
+
+	if err := t.ensureCounter(tpm); err != nil {
+		return nil, err
+	}
 
 	return t, nil
+}
+
+// ensureCounter defines the counter NV index if it doesn't exist yet.
+func (t *TPM) ensureCounter(tpm io.ReadWriter) error {
+	pub, err := tpm2.NVReadPublic(tpm, t.counterIndex)
+	if err == nil {
+		if pub.Attributes&^tpm2.AttrWritten != counterAttrs || pub.DataSize != 8 {
+			return fmt.Errorf("NV index 0x%08x exists but is not a tpm-fido counter (attributes %s)", t.counterIndex, pub.Attributes)
+		}
+		return nil
+	}
+
+	err = tpm2.NVDefineSpace(tpm, tpm2.HandleOwner, t.counterIndex, "", "", nil, counterAttrs, 8)
+	if err != nil {
+		return fmt.Errorf("define counter NV index 0x%08x (requires empty owner auth) err: %w", t.counterIndex, err)
+	}
+	return nil
 }
 
 func primaryKeyTmpl(seed, applicationParam []byte) tpm2.Public {
@@ -78,11 +121,30 @@ func primaryKeyTmpl(seed, applicationParam []byte) tpm2.Public {
 	}
 }
 
-var baseTime = time.Date(2021, time.January, 1, 0, 0, 0, 0, time.UTC)
+// Counter increments the TPM NV counter and returns the new value.
+func (t *TPM) Counter() (uint32, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-func (t *TPM) Counter() uint32 {
-	unix := time.Now().Unix()
-	return uint32(unix - baseTime.Unix())
+	tpm, err := t.open()
+	if err != nil {
+		return 0, fmt.Errorf("open tpm err: %w", err)
+	}
+	defer tpm.Close()
+
+	if err := tpm2.NVIncrement(tpm, t.counterIndex, ""); err != nil {
+		return 0, fmt.Errorf("NV increment err: %w", err)
+	}
+
+	val, err := tpm2.NVReadEx(tpm, t.counterIndex, t.counterIndex, "", 8)
+	if err != nil {
+		return 0, fmt.Errorf("NV read err: %w", err)
+	}
+	if len(val) != 8 {
+		return 0, fmt.Errorf("unexpected counter size %d", len(val))
+	}
+
+	return uint32(binary.BigEndian.Uint64(val) + counterOffset), nil
 }
 
 // Register a new key with the TPM for the given applicationParam.

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/psanford/tpm-fido/attestation"
+	"github.com/psanford/tpm-fido/ctap2"
 	"github.com/psanford/tpm-fido/fidoauth"
 	"github.com/psanford/tpm-fido/fidohid"
 	"github.com/psanford/tpm-fido/memory"
@@ -25,6 +26,7 @@ import (
 
 var backend = flag.String("backend", "tpm", "tpm|memory")
 var device = flag.String("device", "/dev/tpmrm0", "TPM device path")
+var counterIndex = flag.Uint("counter-index", tpm.DefaultCounterIndex, "TPM NV index used for the signature counter")
 
 func main() {
 	flag.Parse()
@@ -40,7 +42,7 @@ type server struct {
 type Signer interface {
 	RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, error)
 	SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, error)
-	Counter() uint32
+	Counter() (uint32, error)
 }
 
 func newServer() *server {
@@ -48,7 +50,7 @@ func newServer() *server {
 		pe: pinentry.New(),
 	}
 	if *backend == "tpm" {
-		signer, err := tpm.New(*device)
+		signer, err := tpm.New(*device, uint32(*counterIndex))
 		if err != nil {
 			panic(err)
 		}
@@ -78,30 +80,43 @@ func (s *server) run() {
 	go token.Run(ctx)
 
 	for evt := range token.Events() {
-		if evt.Error != nil {
-			log.Printf("got token error: %s", err)
-			continue
+		s.handleEvent(ctx, token, evt)
+		token.Release(evt)
+	}
+}
+
+func (s *server) handleEvent(ctx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent) {
+	if evt.Error != nil {
+		log.Printf("got token error: %s", evt.Error)
+		if evt.IsCBOR() {
+			token.WriteCBOR(evt, byte(ctap2.ErrInvalidLength), nil)
 		}
+		return
+	}
 
-		req := evt.Req
+	if evt.IsCBOR() {
+		s.handleCBOR(token, evt)
+		return
+	}
 
-		if req.Command == fidoauth.CmdAuthenticate {
-			log.Printf("got AuthenticateCmd site=%s", sitesignatures.FromAppParam(req.Authenticate.ApplicationParam))
+	req := evt.Req
 
-			s.handleAuthenticate(ctx, token, evt)
-		} else if req.Command == fidoauth.CmdRegister {
-			log.Printf("got RegisterCmd site=%s", sitesignatures.FromAppParam(req.Register.ApplicationParam))
-			s.handleRegister(ctx, token, evt)
-		} else if req.Command == fidoauth.CmdVersion {
-			log.Print("got VersionCmd")
-			s.handleVersion(ctx, token, evt)
-		} else {
-			log.Printf("unsupported request type: 0x%02x\n", req.Command)
-			// send a not supported error for any commands that we don't understand.
-			// Browsers depend on this to detect what features the token supports
-			// (i.e. the u2f backwards compatibility)
-			token.WriteResponse(ctx, evt, nil, statuscode.ClaNotSupported)
-		}
+	if req.Command == fidoauth.CmdAuthenticate {
+		log.Printf("got AuthenticateCmd site=%s", sitesignatures.FromAppParam(req.Authenticate.ApplicationParam))
+
+		s.handleAuthenticate(ctx, token, evt)
+	} else if req.Command == fidoauth.CmdRegister {
+		log.Printf("got RegisterCmd site=%s", sitesignatures.FromAppParam(req.Register.ApplicationParam))
+		s.handleRegister(ctx, token, evt)
+	} else if req.Command == fidoauth.CmdVersion {
+		log.Print("got VersionCmd")
+		s.handleVersion(ctx, token, evt)
+	} else {
+		log.Printf("unsupported request type: 0x%02x\n", req.Command)
+		// send a not supported error for any commands that we don't understand.
+		// Browsers depend on this to detect what features the token supports
+		// (i.e. the u2f backwards compatibility)
+		token.WriteResponse(ctx, evt, nil, statuscode.ClaNotSupported)
 	}
 }
 
@@ -197,7 +212,11 @@ func (s *server) handleAuthenticate(parentCtx context.Context, token *fidohid.So
 		}
 	}
 
-	signCounter := s.signer.Counter()
+	signCounter, err := s.signer.Counter()
+	if err != nil {
+		log.Printf("counter err: %s", err)
+		return
+	}
 
 	var toSign bytes.Buffer
 	toSign.Write(req.Authenticate.ApplicationParam[:])

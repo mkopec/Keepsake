@@ -22,9 +22,9 @@ func New() (*Mem, error) {
 	}, nil
 }
 
-func (m *Mem) Counter() uint32 {
+func (m *Mem) Counter() (uint32, error) {
 	m.signCounter++
-	return m.signCounter
+	return m.signCounter, nil
 }
 
 func (m *Mem) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, error) {

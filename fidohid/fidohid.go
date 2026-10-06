@@ -5,9 +5,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
+	"sync"
 
 	"github.com/psanford/tpm-fido/fidoauth"
 	"github.com/psanford/uhid"
@@ -22,6 +24,12 @@ func New(ctx context.Context, name string) (*SoftToken, error) {
 	d.Data.Bus = busUSB
 	d.Data.VendorID = vendorID
 	d.Data.ProductID = productID
+
+	// uhid defaults to random binary, which hosts expecting a printable
+	// serial number fail to parse.
+	if err := d.SetUniq(hex.EncodeToString(mustRand(8))); err != nil {
+		return nil, err
+	}
 
 	evtChan, err := d.Open(ctx)
 	if err != nil {
@@ -43,13 +51,30 @@ type SoftToken struct {
 	authEvent chan AuthEvent
 
 	authFunc func()
+
+	// writeMu serializes writes of (possibly multi-packet) messages so that
+	// keepalives don't interleave with responses.
+	writeMu sync.Mutex
+
+	// mu protects the in-flight transaction state below.
+	mu         sync.Mutex
+	busy       bool
+	busyChanID uint32
+	cancelTx   context.CancelFunc
 }
 
 type AuthEvent struct {
 	chanID uint32
 	cmd    CmdType
 
-	Req   *fidoauth.AuthenticatorRequest
+	// Ctx is cancelled when the host sends CTAPHID_CANCEL for this
+	// transaction or after Release is called.
+	Ctx context.Context
+
+	// Req is set for U2F (CTAPHID_MSG) requests
+	Req *fidoauth.AuthenticatorRequest
+	// CBOR is set for CTAP2 (CTAPHID_CBOR) requests
+	CBOR  []byte
 	Error error
 }
 
@@ -82,6 +107,10 @@ func (t *SoftToken) Run(ctx context.Context) {
 		)
 
 		for pkt := range pktChan {
+			if !pkt.IsInitial && pkt.ChannelID != reqChanID {
+				log.Printf("dropping continuation packet for channel 0x%08x", pkt.ChannelID)
+				continue
+			}
 			if pkt.IsInitial {
 				if len(innerMsg) > 0 {
 					log.Print("new initial packet while pending packets still exist")
@@ -101,6 +130,17 @@ func (t *SoftToken) Run(ctx context.Context) {
 		innerMsg = innerMsg[:int(needSize)]
 
 		switch cmd {
+		case CmdPing:
+			err := t.writeMessage(reqChanID, CmdPing, innerMsg)
+			if err != nil {
+				log.Printf("Write ping resp err: %s", err)
+			}
+		case CmdCancel:
+			t.mu.Lock()
+			if t.busy && t.busyChanID == reqChanID {
+				t.cancelTx()
+			}
+			t.mu.Unlock()
 		case CmdInit:
 			chanID, ok := allocateChan()
 			if !ok {
@@ -112,19 +152,29 @@ func (t *SoftToken) Run(ctx context.Context) {
 
 			resp := newInitResponse(chanID, nonce)
 
-			err := writeRespose(t.device, reqChanID, CmdInit, resp.Marshal(), 0)
+			err := t.writeMessage(reqChanID, CmdInit, resp.Marshal())
 			if err != nil {
 				log.Printf("Write Init resp err: %s", err)
 				continue
 			}
-		case CmdMsg:
-			req, err := fidoauth.DecodeAuthenticatorRequest(innerMsg)
+		case CmdMsg, CmdCbor:
+			txCtx, ok := t.beginTx(ctx, reqChanID)
+			if !ok {
+				t.writeError(reqChanID, errChannelBusy)
+				continue
+			}
 
 			evt := AuthEvent{
 				chanID: reqChanID,
 				cmd:    cmd,
-				Req:    req,
-				Error:  err,
+				Ctx:    txCtx,
+			}
+			if cmd == CmdMsg {
+				evt.Req, evt.Error = fidoauth.DecodeAuthenticatorRequest(innerMsg)
+			} else if len(innerMsg) == 0 {
+				evt.Error = fmt.Errorf("empty cbor request")
+			} else {
+				evt.CBOR = innerMsg
 			}
 
 			select {
@@ -134,7 +184,7 @@ func (t *SoftToken) Run(ctx context.Context) {
 			}
 		default:
 			log.Printf("unsuppoted cmd: %s %d", cmd, cmd)
-			writeRespose(t.device, reqChanID, cmd, nil, swInsNotSupported)
+			t.writeError(reqChanID, errInvalidCmd)
 		}
 	}
 }
@@ -148,14 +198,16 @@ const (
 	frameTypeInit = 0x80
 	frameTypeCont = 0x00
 
-	CmdPing  CmdType = 0x01 // Echo data through local processor only
-	CmdMsg   CmdType = 0x03 // Send U2F message frame
-	CmdLock  CmdType = 0x04 // Send lock channel command
-	CmdInit  CmdType = 0x06 // Channel initialization
-	CmdWink  CmdType = 0x08 // Send device identification wink
-	CmdCbor  CmdType = 0x10 // Send encapsulated CTAP CBOR
-	CmdSync  CmdType = 0x3c // Protocol resync command
-	CmdError CmdType = 0x3f // Error response
+	CmdPing      CmdType = 0x01 // Echo data through local processor only
+	CmdMsg       CmdType = 0x03 // Send U2F message frame
+	CmdLock      CmdType = 0x04 // Send lock channel command
+	CmdInit      CmdType = 0x06 // Channel initialization
+	CmdWink      CmdType = 0x08 // Send device identification wink
+	CmdCbor      CmdType = 0x10 // Send encapsulated CTAP CBOR
+	CmdCancel    CmdType = 0x11 // Cancel outstanding requests
+	CmdKeepalive CmdType = 0x3b // Processing status notification
+	CmdSync      CmdType = 0x3c // Protocol resync command
+	CmdError     CmdType = 0x3f // Error response
 
 	vendorSpecificFirstCmd = 0x40
 	vendorSpecificLastCmd  = 0x7f
@@ -173,7 +225,13 @@ const (
 	cborCapability     = 0x04
 	nmsgCapability     = 0x08
 
-	swInsNotSupported = 0x6D00 // The Instruction of the request is not supported
+	// CTAPHID_ERROR codes
+	errInvalidCmd  = 0x01
+	errChannelBusy = 0x06
+
+	// CTAPHID_KEEPALIVE status codes
+	KeepaliveProcessing = 0x01
+	KeepaliveUPNeeded   = 0x02
 )
 
 type CmdType uint8
@@ -200,6 +258,10 @@ func (c CmdType) String() string {
 		return "CmdError"
 	case CmdCbor:
 		return "CmdCbor"
+	case CmdCancel:
+		return "CmdCancel"
+	case CmdKeepalive:
+		return "CmdKeepalive"
 	}
 
 	if c >= vendorSpecificFirstCmd && c <= vendorSpecificLastCmd {
@@ -434,7 +496,7 @@ func newInitResponse(channelID uint32, nonce [8]byte) *initResponse {
 		MajorDeviceVersion: deviceMajor,
 		MinorDeviceVersion: deviceMinor,
 		BuildDeviceVersion: deviceBuild,
-		// RawCapabilities:    winkCapability,
+		RawCapabilities:    cborCapability,
 	}
 }
 
@@ -453,24 +515,84 @@ func (resp *initResponse) Marshal() []byte {
 	return buf.Bytes()
 }
 
-func (t *SoftToken) WriteResponse(ctx context.Context, evt AuthEvent, data []byte, status uint16) error {
-	return writeRespose(t.device, evt.chanID, evt.cmd, data, status)
+// IsCBOR reports whether evt is a CTAP2 (CTAPHID_CBOR) request.
+func (evt AuthEvent) IsCBOR() bool {
+	return evt.cmd == CmdCbor
 }
 
-func writeRespose(d *uhid.Device, chanID uint32, cmd CmdType, data []byte, status uint16) error {
+// beginTx marks the token as busy with a transaction on chanID. It returns
+// false if another transaction is already in flight.
+func (t *SoftToken) beginTx(ctx context.Context, chanID uint32) (context.Context, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
-	initial := true
-	pktSize := initialPacketDataLen
+	if t.busy {
+		return nil, false
+	}
 
+	txCtx, cancel := context.WithCancel(ctx)
+	t.busy = true
+	t.busyChanID = chanID
+	t.cancelTx = cancel
+	return txCtx, true
+}
+
+// Release ends the transaction started by evt. It must be called once the
+// event has been handled, whether or not a response was written.
+func (t *SoftToken) Release(evt AuthEvent) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.busy && t.busyChanID == evt.chanID {
+		t.cancelTx()
+		t.busy = false
+	}
+}
+
+// WriteResponse writes a U2F response with the given status word.
+func (t *SoftToken) WriteResponse(ctx context.Context, evt AuthEvent, data []byte, status uint16) error {
 	if status > 0 {
 		statusBytes := make([]byte, 2)
 		binary.BigEndian.PutUint16(statusBytes, status)
 		data = append(data, statusBytes...)
 	}
+	return t.writeMessage(evt.chanID, evt.cmd, data)
+}
+
+// WriteCBOR writes a CTAP2 response: a status byte followed by the CBOR
+// encoded body.
+func (t *SoftToken) WriteCBOR(evt AuthEvent, status byte, body []byte) error {
+	data := append([]byte{status}, body...)
+	return t.writeMessage(evt.chanID, CmdCbor, data)
+}
+
+// KeepAlive tells the host the request is still being processed.
+func (t *SoftToken) KeepAlive(evt AuthEvent, status byte) error {
+	return t.writeMessage(evt.chanID, CmdKeepalive, []byte{status})
+}
+
+func (t *SoftToken) writeError(chanID uint32, code byte) {
+	err := t.writeMessage(chanID, CmdError, []byte{code})
+	if err != nil {
+		log.Printf("Write error resp err: %s", err)
+	}
+}
+
+func (t *SoftToken) writeMessage(chanID uint32, cmd CmdType, data []byte) error {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+
+	return writeRespose(t.device, chanID, cmd, data)
+}
+
+func writeRespose(d *uhid.Device, chanID uint32, cmd CmdType, data []byte) error {
+
+	initial := true
+	pktSize := initialPacketDataLen
 
 	totalSize := uint16(len(data))
 	var seqNo uint8
-	for len(data) > 0 {
+	for initial || len(data) > 0 {
 		sliceSize := pktSize
 		if len(data) < sliceSize {
 			sliceSize = len(data)
