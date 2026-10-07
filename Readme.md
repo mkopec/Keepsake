@@ -4,6 +4,11 @@ tpm-fido is FIDO token implementation for Linux that protects the token keys by 
 
 It speaks U2F and CTAP 2.0: passkeys, a PIN enforced by the TPM, `hmac-secret` (e.g. for LUKS) and `credProtect`. On GNOME it uses the system prompt for confirmations, refuses requests while the screen is locked, works with GNOME's SSH agent, and comes with a "Security Keys" app.
 
+## Screenshots
+
+![login](pics/login.png)
+![settings](pics/settings.png)
+
 ## Quick start
 
 ```
