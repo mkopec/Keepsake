@@ -128,6 +128,28 @@ class Window(Adw.ApplicationWindow):
         for e in ([error] if error else []) + errors:
             self.toast(e)
         self.render()
+        # The passkeys shown were listed when the PIN was entered; list them
+        # again, they may have changed (e.g. a passkey created in a browser).
+        if self.key is not None and self.pin is not None:
+            self.reload_passkeys()
+
+    def reload_passkeys(self):
+        key, pin = self.key, self.pin
+        self.busy(True)
+
+        def done(passkeys, err):
+            self.busy(False)
+            if key is not self.key:
+                return
+            if err:
+                # e.g. the PIN was changed elsewhere: ask for it again
+                self.pin, self.passkeys = None, None
+                self.toast(err)
+            else:
+                self.passkeys = passkeys
+            self.render()
+
+        run_in_thread(lambda: key.passkeys(pin), done)
 
     def select_key(self, index):
         if self.keys[index] is not self.key:
