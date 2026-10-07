@@ -13,6 +13,7 @@ import (
 	"github.com/psanford/tpm-fido/ctap2"
 	"github.com/psanford/tpm-fido/fidohid"
 	"github.com/psanford/tpm-fido/passkeys"
+	"github.com/psanford/tpm-fido/pinentry"
 )
 
 // aaguid identifies the tpm-fido authenticator model:
@@ -166,20 +167,18 @@ func (s *server) makeCredential(evt fidohid.AuthEvent, ka *keepalive, req *ctap2
 		if cred.Type == ctap2.CredentialTypePublic && s.ownsCredential(cred.ID, rpIDHash[:]) {
 			// Require user presence so a site can't silently probe for
 			// registered credentials.
-			desc := fmt.Sprintf("This authenticator is already registered with %s", req.RP.ID)
-			if err := s.confirmPresence(evt, ka, desc); err != nil {
+			if err := s.confirmPresence(evt, ka, alreadyRegisteredPrompt(displayText(req.RP.ID, 253))); err != nil {
 				return nil, err
 			}
 			return nil, ctap2.ErrCredentialExcluded
 		}
 	}
 
-	action := "Register with"
+	prompt := registerPrompt(displayText(req.RP.ID, 253), userLabel(req.User))
 	if rk {
-		action = "Create a passkey for"
+		prompt = passkeyPrompt(displayText(req.RP.ID, 253), userLabel(req.User))
 	}
-	desc := fmt.Sprintf("%s %s%s\nUser: %s", action, req.RP.ID, uvSuffix(uv), userLabel(req.User))
-	if err := s.confirmPresence(evt, ka, desc); err != nil {
+	if err := s.confirmPresence(evt, ka, prompt); err != nil {
 		return nil, err
 	}
 
@@ -300,7 +299,7 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 
 	var flags byte
 	if up {
-		if err := s.confirmPresence(evt, ka, fmt.Sprintf("Sign in to %s%s", req.RPID, uvSuffix(uv))); err != nil {
+		if err := s.confirmPresence(evt, ka, signInPrompt(displayText(req.RPID, 253))); err != nil {
 			return nil, err
 		}
 		flags |= ctap2.FlagUserPresent
@@ -390,7 +389,7 @@ func (s *server) selectAuthenticator(evt fidohid.AuthEvent, ka *keepalive, param
 	if param == nil || len(*param) > 0 {
 		return nil
 	}
-	if err := s.confirmPresence(evt, ka, "Select this authenticator"); err != nil {
+	if err := s.confirmPresence(evt, ka, selectPrompt()); err != nil {
 		return err
 	}
 	set, err := s.pins.PINSet()
@@ -425,14 +424,14 @@ func (s *server) ownsCredential(credID, rpIDHash []byte) bool {
 
 // confirmPresence asks the user to confirm the request. It returns nil if the
 // user confirmed and the CTAP2 status to return otherwise.
-func (s *server) confirmPresence(evt fidohid.AuthEvent, ka *keepalive, desc string) error {
+func (s *server) confirmPresence(evt fidohid.AuthEvent, ka *keepalive, prompt pinentry.Prompt) error {
 	ka.set(fidohid.KeepaliveUPNeeded)
 	defer ka.set(fidohid.KeepaliveProcessing)
 
 	ctx, cancel := context.WithTimeout(evt.Ctx, userPresenceTimeout)
 	defer cancel()
 
-	ok, err := s.pe.Confirm(ctx, desc)
+	ok, err := s.pe.Confirm(ctx, prompt)
 	switch {
 	case evt.Ctx.Err() != nil:
 		return ctap2.ErrKeepaliveCancel
@@ -459,10 +458,7 @@ func userLabel(u *ctap2.User) string {
 	if label == "" {
 		label = u.DisplayName
 	}
-	if r := []rune(label); len(r) > 64 {
-		label = string(r[:64]) + "…"
-	}
-	return label
+	return displayText(label, 64)
 }
 
 // keepalive periodically sends CTAPHID_KEEPALIVE messages while a CTAP2

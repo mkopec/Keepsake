@@ -16,8 +16,7 @@ import (
 func (s *server) reset(evt fidohid.AuthEvent, ka *keepalive) (interface{}, error) {
 	log.Print("got ctap2 Reset")
 
-	desc := "RESET this authenticator?\n\nAll its credentials (passkeys and security key registrations) and its PIN will be permanently deleted. You will not be able to sign in with them anymore."
-	if err := s.confirmPresence(evt, ka, desc); err != nil {
+	if err := s.confirmPresence(evt, ka, resetPrompt()); err != nil {
 		return nil, err
 	}
 

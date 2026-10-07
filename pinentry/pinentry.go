@@ -31,12 +31,34 @@ type request struct {
 	applicationParam [32]byte
 }
 
+// Prompt is the content of a confirmation dialog. pinentry-gnome3 shows it
+// as a GNOME Shell system prompt: Heading as the bold heading, Body below
+// it, and a Cancel and an OK button. Other pinentries don't show the
+// heading of a confirmation, so it is also used as the window title.
+type Prompt struct {
+	Heading string
+	Body    string
+	// OK labels the confirming button. GNOME's HIG asks for a verb
+	// describing the action ("Sign In"), not "OK".
+	OK string
+}
+
+func (p Prompt) apply(c *pinentry.Client) {
+	c.SetTitle(p.Heading)
+	c.SetPrompt(p.Heading)
+	c.SetDesc(p.Body)
+	if p.OK != "" {
+		c.SetOkBtn(p.OK)
+	}
+	c.SetCancelBtn("Cancel")
+}
+
 type Result struct {
 	OK    bool
 	Error error
 }
 
-func (pe *Pinentry) ConfirmPresence(prompt string, challengeParam, applicationParam [32]byte) (chan Result, error) {
+func (pe *Pinentry) ConfirmPresence(prompt Prompt, challengeParam, applicationParam [32]byte) (chan Result, error) {
 	pe.mu.Lock()
 	defer pe.mu.Unlock()
 
@@ -72,11 +94,11 @@ func (pe *Pinentry) ConfirmPresence(prompt string, challengeParam, applicationPa
 	return pe.activeRequest.pendingResult, nil
 }
 
-// Confirm shows a confirmation dialog with the given description and blocks
+// Confirm shows a confirmation dialog and blocks
 // until the user answers or ctx is done. It returns true if the user
 // confirmed. Unlike ConfirmPresence it is meant for CTAP2 requests, where the
 // host waits for a single request instead of polling.
-func (pe *Pinentry) Confirm(ctx context.Context, desc string) (bool, error) {
+func (pe *Pinentry) Confirm(ctx context.Context, prompt Prompt) (bool, error) {
 	pe.mu.Lock()
 	if pe.activeRequest != nil {
 		pe.mu.Unlock()
@@ -103,9 +125,7 @@ func (pe *Pinentry) Confirm(ctx context.Context, desc string) (bool, error) {
 	}()
 
 	defer p.Shutdown()
-	p.SetTitle("TPM-FIDO")
-	p.SetPrompt("TPM-FIDO")
-	p.SetDesc(desc)
+	prompt.apply(p)
 
 	promptResult := make(chan error, 1)
 	go func() {
@@ -123,7 +143,7 @@ func (pe *Pinentry) Confirm(ctx context.Context, desc string) (bool, error) {
 	}
 }
 
-func (pe *Pinentry) prompt(req *request, prompt string) {
+func (pe *Pinentry) prompt(req *request, prompt Prompt) {
 	sendResult := func(r Result) {
 		select {
 		case req.pendingResult <- r:
@@ -154,9 +174,7 @@ func (pe *Pinentry) prompt(req *request, prompt string) {
 	}()
 
 	defer p.Shutdown()
-	p.SetTitle("TPM-FIDO")
-	p.SetPrompt("TPM-FIDO")
-	p.SetDesc(prompt)
+	prompt.apply(p)
 
 	promptResult := make(chan bool)
 

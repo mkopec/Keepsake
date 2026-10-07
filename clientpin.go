@@ -329,10 +329,3 @@ func (s *server) checkPINUVAuth(param *[]byte, protocol uint, clientDataHash []b
 	}
 	return true, nil
 }
-
-func uvSuffix(uv bool) string {
-	if uv {
-		return " (PIN verified)"
-	}
-	return ""
-}

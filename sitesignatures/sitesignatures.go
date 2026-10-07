@@ -37,6 +37,12 @@ func hashURL(url string) [32]byte {
 	return sha256.Sum256([]byte(url))
 }
 
+// Known returns the site name for a U2F application parameter, or "" if it
+// isn't a known site. U2F only sends a hash of the site's app ID.
+func Known(sig [32]byte) string {
+	return reverseSignatures[sig]
+}
+
 func FromAppParam(sig [32]byte) string {
 	site := reverseSignatures[sig]
 	if site == "" {
