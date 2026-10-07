@@ -11,6 +11,8 @@ import (
 	"flag"
 	"log"
 	"math/big"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/psanford/tpm-fido/attestation"
@@ -18,6 +20,7 @@ import (
 	"github.com/psanford/tpm-fido/fidoauth"
 	"github.com/psanford/tpm-fido/fidohid"
 	"github.com/psanford/tpm-fido/memory"
+	"github.com/psanford/tpm-fido/passkeys"
 	"github.com/psanford/tpm-fido/pinentry"
 	"github.com/psanford/tpm-fido/sitesignatures"
 	"github.com/psanford/tpm-fido/statuscode"
@@ -28,6 +31,9 @@ var backend = flag.String("backend", "tpm", "tpm|memory")
 var device = flag.String("device", "/dev/tpmrm0", "TPM device path")
 var counterIndex = flag.Uint("counter-index", tpm.DefaultCounterIndex, "TPM NV index used for the signature counter")
 var pinIndex = flag.Uint("pin-index", tpm.DefaultPINIndex, "TPM NV index used for the clientPIN")
+var stateIndex = flag.Uint("state-index", tpm.DefaultStateIndex, "TPM NV index used for state flags")
+var deviceKeyHandle = flag.Uint("device-key-handle", tpm.DefaultDeviceKeyHandle, "TPM persistent handle of the device key")
+var passkeyStore = flag.String("passkey-store", "", "passkey store path (default $XDG_DATA_HOME/tpm-fido/passkeys)")
 
 func main() {
 	flag.Parse()
@@ -40,15 +46,26 @@ type server struct {
 	signer Signer
 	pins   PINStore
 	pin    *pinState
+
+	passkeys      *passkeys.Store
+	storeKey      []byte
+	nextAssertion *assertionState
+	credMgmt      *credMgmtState
 }
 
 type Signer interface {
-	RegisterKey(applicationParam []byte, hmacSecret bool) ([]byte, *big.Int, *big.Int, error)
+	RegisterKey(applicationParam []byte, hmacSecret, discoverable bool) ([]byte, *big.Int, *big.Int, error)
+	// IsDiscoverable reports whether keyHandle was created as a passkey.
+	IsDiscoverable(keyHandle []byte) bool
 	SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, error)
 	Counter() (uint32, error)
 	// HMACSecret returns the hmac-secret CredRandom of a credential, the
 	// one used with user verification if uvPinHash is set.
 	HMACSecret(keyHandle, rpIDHash, uvPinHash []byte) ([]byte, error)
+	// StoreKey returns the passkey store encryption key.
+	StoreKey() ([]byte, error)
+	// Reset invalidates every credential and removes the PIN.
+	Reset() error
 }
 
 func newServer() *server {
@@ -57,7 +74,12 @@ func newServer() *server {
 		pin: newPINState(),
 	}
 	if *backend == "tpm" {
-		signer, err := tpm.New(*device, uint32(*counterIndex), uint32(*pinIndex))
+		signer, err := tpm.New(*device, tpm.Handles{
+			CounterIndex: uint32(*counterIndex),
+			PINIndex:     uint32(*pinIndex),
+			StateIndex:   uint32(*stateIndex),
+			DeviceKey:    uint32(*deviceKeyHandle),
+		})
 		if err != nil {
 			panic(err)
 		}
@@ -71,6 +93,22 @@ func newServer() *server {
 		s.signer = signer
 		s.pins = signer
 	}
+
+	path := *passkeyStore
+	if path == "" && *backend == "memory" {
+		// the memory backend's keys don't outlive the process
+		dir, err := os.MkdirTemp("", "tpm-fido-memory-")
+		if err != nil {
+			panic(err)
+		}
+		path = filepath.Join(dir, "passkeys")
+	} else if path == "" {
+		var err error
+		if path, err = passkeys.DefaultPath(); err != nil {
+			panic(err)
+		}
+	}
+	s.passkeys = s.newPasskeyStore(path)
 	return &s
 }
 
@@ -139,11 +177,8 @@ func (s *server) handleAuthenticate(parentCtx context.Context, token *fidohid.So
 	keyHandle := req.Authenticate.KeyHandle
 	appParam := req.Authenticate.ApplicationParam[:]
 
-	dummySig := sha256.Sum256([]byte("meticulously-Bacardi"))
-
-	_, err := s.signer.SignASN1(keyHandle, appParam, dummySig[:])
-	if err != nil {
-		log.Printf("invalid key: %s (key handle size: %d)", err, len(keyHandle))
+	if !s.ownsCredential(keyHandle, appParam) {
+		log.Printf("invalid key handle (size: %d)", len(keyHandle))
 
 		err := token.WriteResponse(parentCtx, evt, nil, statuscode.WrongData)
 		if err != nil {
@@ -298,7 +333,7 @@ func (s *server) handleRegister(parentCtx context.Context, token *fidohid.SoftTo
 func (s *server) registerSite(ctx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent) {
 	req := evt.Req
 
-	keyHandle, x, y, err := s.signer.RegisterKey(req.Register.ApplicationParam[:], false)
+	keyHandle, x, y, err := s.signer.RegisterKey(req.Register.ApplicationParam[:], false, false)
 	if err != nil {
 		log.Printf("RegisteKey err: %s", err)
 		return

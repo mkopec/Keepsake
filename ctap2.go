@@ -12,6 +12,7 @@ import (
 
 	"github.com/psanford/tpm-fido/ctap2"
 	"github.com/psanford/tpm-fido/fidohid"
+	"github.com/psanford/tpm-fido/passkeys"
 )
 
 // aaguid identifies the tpm-fido authenticator model:
@@ -50,6 +51,15 @@ func (s *server) handleCBOR(token *fidohid.SoftToken, evt fidohid.AuthEvent) {
 func (s *server) dispatchCBOR(evt fidohid.AuthEvent, ka *keepalive) (interface{}, error) {
 	cmd, params := evt.CBOR[0], evt.CBOR[1:]
 
+	// GetNextAssertion must directly follow GetAssertion
+	if cmd != ctap2.CmdGetNextAssertion {
+		s.nextAssertion = nil
+	}
+	// credential management enumerations must not be interrupted either
+	if cmd != ctap2.CmdCredentialMgmt && cmd != ctap2.CmdCredentialMgmtPreview {
+		s.credMgmt = nil
+	}
+
 	switch cmd {
 	case ctap2.CmdGetInfo:
 		log.Print("got ctap2 GetInfo")
@@ -58,14 +68,18 @@ func (s *server) dispatchCBOR(evt fidohid.AuthEvent, ka *keepalive) (interface{}
 			return nil, err
 		}
 		return ctap2.GetInfoResp{
-			Versions:   []string{"U2F_V2", "FIDO_2_0"},
+			// FIDO_2_1_PRE advertises the credential management
+			// preview command.
+			Versions:   []string{"U2F_V2", "FIDO_2_0", "FIDO_2_1_PRE"},
 			Extensions: []string{ctap2.ExtHMACSecret},
 			AAGUID:     aaguid,
 			Options: map[string]bool{
-				"rk":        false,
+				"rk":        true,
 				"up":        true,
 				"plat":      false,
 				"clientPin": pinSet,
+
+				"credentialMgmtPreview": true,
 			},
 			MaxMsgSize:   maxMsgSize,
 			PinProtocols: []uint{2, 1},
@@ -88,9 +102,17 @@ func (s *server) dispatchCBOR(evt fidohid.AuthEvent, ka *keepalive) (interface{}
 			return nil, err
 		}
 		return s.getAssertion(evt, ka, &req)
+	case ctap2.CmdCredentialMgmt, ctap2.CmdCredentialMgmtPreview:
+		var req ctap2.CredMgmtReq
+		if err := ctap2.Unmarshal(params, &req); err != nil {
+			return nil, err
+		}
+		return s.credentialManagement(&req)
+	case ctap2.CmdReset:
+		return s.reset(evt, ka)
 	case ctap2.CmdGetNextAssertion:
-		// only needed for discoverable credentials, which we don't support
-		return nil, ctap2.ErrNotAllowed
+		log.Print("got ctap2 GetNextAssertion")
+		return s.getNextAssertion()
 	default:
 		log.Printf("unsupported ctap2 command 0x%02x", cmd)
 		return nil, ctap2.ErrInvalidCommand
@@ -119,9 +141,7 @@ func (s *server) makeCredential(evt fidohid.AuthEvent, ka *keepalive, req *ctap2
 		return nil, ctap2.ErrUnsupportedAlgorithm
 	}
 
-	if req.Options["rk"] {
-		return nil, ctap2.ErrUnsupportedOption
-	}
+	rk := req.Options["rk"]
 	if up, ok := req.Options["up"]; ok && !up {
 		return nil, ctap2.ErrInvalidOption
 	}
@@ -154,12 +174,16 @@ func (s *server) makeCredential(evt fidohid.AuthEvent, ka *keepalive, req *ctap2
 		}
 	}
 
-	desc := fmt.Sprintf("Register with %s%s\nUser: %s", req.RP.ID, uvSuffix(uv), userLabel(req.User))
+	action := "Register with"
+	if rk {
+		action = "Create a passkey for"
+	}
+	desc := fmt.Sprintf("%s %s%s\nUser: %s", action, req.RP.ID, uvSuffix(uv), userLabel(req.User))
 	if err := s.confirmPresence(evt, ka, desc); err != nil {
 		return nil, err
 	}
 
-	credID, x, y, err := s.signer.RegisterKey(rpIDHash[:], hmacSecret)
+	credID, x, y, err := s.signer.RegisterKey(rpIDHash[:], hmacSecret, rk)
 	if err != nil {
 		return nil, fmt.Errorf("register key err: %w", err)
 	}
@@ -189,6 +213,22 @@ func (s *server) makeCredential(evt fidohid.AuthEvent, ka *keepalive, req *ctap2
 	sig, err := s.signer.SignASN1(credID, rpIDHash[:], signedDigest(authData, req.ClientDataHash))
 	if err != nil {
 		return nil, fmt.Errorf("attestation sign err: %w", err)
+	}
+
+	if rk {
+		err := s.storePasskey(passkeys.Credential{
+			ID:              credID,
+			RPID:            req.RP.ID,
+			RPName:          req.RP.Name,
+			UserID:          req.User.ID,
+			UserName:        req.User.Name,
+			UserDisplayName: req.User.DisplayName,
+			PublicKey:       coseKey,
+			Created:         time.Now().Unix(),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("store passkey err: %w", err)
+		}
 	}
 
 	return ctap2.MakeCredentialResp{
@@ -234,12 +274,24 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 
 	rpIDHash := sha256.Sum256([]byte(req.RPID))
 
-	// Without discoverable credentials an empty allowList can never match.
-	var credID []byte
-	for _, cred := range req.AllowList {
-		if cred.Type == ctap2.CredentialTypePublic && s.ownsCredential(cred.ID, rpIDHash[:]) {
-			credID = cred.ID
-			break
+	var (
+		credID []byte
+		// discoverable credentials, when allowList is empty
+		discovered []passkeys.Credential
+	)
+	if len(req.AllowList) > 0 {
+		for _, cred := range req.AllowList {
+			if cred.Type == ctap2.CredentialTypePublic && s.ownsCredential(cred.ID, rpIDHash[:]) {
+				credID = cred.ID
+				break
+			}
+		}
+	} else {
+		if discovered, err = s.discoverablePasskeys(req.RPID); err != nil {
+			return nil, err
+		}
+		if len(discovered) > 0 {
+			credID = discovered[0].ID
 		}
 	}
 	if credID == nil {
@@ -257,9 +309,37 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 		flags |= ctap2.FlagUserVerified
 	}
 
+	resp, err := s.assert(credID, rpIDHash[:], req.ClientDataHash, flags, uv, hmacReq)
+	if err != nil {
+		return nil, err
+	}
+
+	if discovered != nil {
+		resp.User = passkeyUser(&discovered[0], uv)
+		if len(discovered) > 1 {
+			// The platform lets the user pick and fetches the other
+			// assertions with GetNextAssertion.
+			resp.NumberOfCredentials = len(discovered)
+			s.nextAssertion = &assertionState{
+				creds:          discovered[1:],
+				rpIDHash:       rpIDHash[:],
+				clientDataHash: req.ClientDataHash,
+				flags:          flags,
+				uv:             uv,
+				hmacReq:        hmacReq,
+				expires:        time.Now().Add(nextAssertionTimeout),
+			}
+		}
+	}
+	return resp, nil
+}
+
+// assert signs an assertion with credID.
+func (s *server) assert(credID, rpIDHash, clientDataHash []byte, flags byte, uv bool, hmacReq *hmacSecretRequest) (*ctap2.GetAssertionResp, error) {
 	var extensions []byte
 	if hmacReq != nil {
-		if extensions, err = s.hmacSecretOutput(hmacReq, credID, rpIDHash[:], uv); err != nil {
+		var err error
+		if extensions, err = s.hmacSecretOutput(hmacReq, credID, rpIDHash, uv); err != nil {
 			return nil, err
 		}
 	}
@@ -268,14 +348,14 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 	if err != nil {
 		return nil, fmt.Errorf("counter err: %w", err)
 	}
-	authData := ctap2.AuthenticatorData(rpIDHash[:], flags, counter, nil, extensions)
+	authData := ctap2.AuthenticatorData(rpIDHash, flags, counter, nil, extensions)
 
-	sig, err := s.signer.SignASN1(credID, rpIDHash[:], signedDigest(authData, req.ClientDataHash))
+	sig, err := s.signer.SignASN1(credID, rpIDHash, signedDigest(authData, clientDataHash))
 	if err != nil {
 		return nil, fmt.Errorf("assertion sign err: %w", err)
 	}
 
-	return ctap2.GetAssertionResp{
+	return &ctap2.GetAssertionResp{
 		Credential: ctap2.CredentialDescriptor{
 			Type: ctap2.CredentialTypePublic,
 			ID:   credID,
@@ -324,8 +404,20 @@ func (s *server) selectAuthenticator(evt fidohid.AuthEvent, ka *keepalive, param
 }
 
 // ownsCredential reports whether credID is a credential created by this
-// authenticator for rpIDHash.
+// authenticator for rpIDHash. Discoverable credentials must also be in the
+// passkey store: deleting a passkey revokes it.
 func (s *server) ownsCredential(credID, rpIDHash []byte) bool {
+	if s.signer.IsDiscoverable(credID) {
+		stored, err := s.storedPasskey(credID, rpIDHash)
+		if err != nil {
+			log.Printf("passkey store err: %s", err)
+			return false
+		}
+		if stored == nil {
+			return false
+		}
+	}
+
 	dummySig := sha256.Sum256([]byte("meticulously-Bacardi"))
 	_, err := s.signer.SignASN1(credID, rpIDHash, dummySig[:])
 	return err == nil

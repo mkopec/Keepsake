@@ -38,10 +38,12 @@ const (
 	ErrInvalidParameter     Status = 0x02
 	ErrInvalidLength        Status = 0x03
 	ErrInvalidCBOR          Status = 0x12
+	ErrInvalidSubcommand    Status = 0x3E
 	ErrMissingParameter     Status = 0x14
 	ErrCredentialExcluded   Status = 0x19
 	ErrUnsupportedAlgorithm Status = 0x26
 	ErrOperationDenied      Status = 0x27
+	ErrKeyStoreFull         Status = 0x28
 	ErrUnsupportedOption    Status = 0x2B
 	ErrInvalidOption        Status = 0x2C
 	ErrKeepaliveCancel      Status = 0x2D
@@ -176,9 +178,11 @@ type MakeCredentialResp struct {
 }
 
 type GetAssertionResp struct {
-	Credential CredentialDescriptor `cbor:"1,keyasint"`
-	AuthData   []byte               `cbor:"2,keyasint"`
-	Signature  []byte               `cbor:"3,keyasint"`
+	Credential          CredentialDescriptor `cbor:"1,keyasint"`
+	AuthData            []byte               `cbor:"2,keyasint"`
+	Signature           []byte               `cbor:"3,keyasint"`
+	User                *User                `cbor:"4,keyasint,omitempty"`
+	NumberOfCredentials int                  `cbor:"5,keyasint,omitempty"`
 }
 
 // COSEKeyES256 encodes a P-256 public key as a COSE_Key.

@@ -12,6 +12,8 @@ import (
 	"sync"
 
 	"github.com/google/go-tpm/legacy/tpm2"
+	tpm2new "github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/google/go-tpm/tpmutil"
 	"github.com/psanford/tpm-fido/internal/lencode"
 	"golang.org/x/crypto/cryptobyte"
@@ -43,22 +45,48 @@ const nvTypeCounter tpm2.NVAttr = 0x10
 const counterAttrs = nvTypeCounter | tpm2.AttrAuthWrite | tpm2.AttrAuthRead |
 	tpm2.AttrNoDA | tpm2.AttrOrderly
 
+// Handles are the TPM NV indices and persistent handles used by tpm-fido.
+type Handles struct {
+	CounterIndex uint32
+	PINIndex     uint32
+	StateIndex   uint32
+	DeviceKey    uint32
+}
+
+// DefaultHandles returns the default TPM handles.
+func DefaultHandles() Handles {
+	return Handles{
+		CounterIndex: DefaultCounterIndex,
+		PINIndex:     DefaultPINIndex,
+		StateIndex:   DefaultStateIndex,
+		DeviceKey:    DefaultDeviceKeyHandle,
+	}
+}
+
 type TPM struct {
-	devicePath     string
-	counterIndex   tpmutil.Handle
-	pinIndexHandle uint32
-	mu             sync.Mutex
+	devicePath      string
+	counterIndex    tpmutil.Handle
+	pinIndexHandle  uint32
+	stateIndex      uint32
+	deviceKeyHandle uint32
+
+	mu sync.Mutex
+	// protected by mu
+	deviceKeyName  tpm2new.TPM2BName
+	legacyDisabled bool
 }
 
 func (t *TPM) open() (io.ReadWriteCloser, error) {
 	return tpm2.OpenTPM(t.devicePath)
 }
 
-func New(devicePath string, counterIndex, pinIndex uint32) (*TPM, error) {
+func New(devicePath string, h Handles) (*TPM, error) {
 	t := &TPM{
-		devicePath:     devicePath,
-		counterIndex:   tpmutil.Handle(counterIndex),
-		pinIndexHandle: pinIndex,
+		devicePath:      devicePath,
+		counterIndex:    tpmutil.Handle(h.CounterIndex),
+		pinIndexHandle:  h.PINIndex,
+		stateIndex:      h.StateIndex,
+		deviceKeyHandle: h.DeviceKey,
 	}
 
 	tpm, err := t.open()
@@ -70,6 +98,15 @@ func New(devicePath string, counterIndex, pinIndex uint32) (*TPM, error) {
 	if err := t.ensureCounter(tpm); err != nil {
 		return nil, err
 	}
+	tr := transport.FromReadWriter(tpm)
+	if err := t.ensureDeviceKey(tr); err != nil {
+		return nil, err
+	}
+	state, err := t.readState(tr)
+	if err != nil {
+		return nil, err
+	}
+	t.legacyDisabled = state&stateLegacyDisabled != 0
 
 	return t, nil
 }
@@ -91,40 +128,68 @@ func (t *TPM) ensureCounter(tpm io.ReadWriter) error {
 	return nil
 }
 
-// Key handles created by current versions prefix the seed with a version
-// byte. Their keys have noDA set: the keys have an empty authValue, so
+// Key handles created by current versions prefix the 20 byte seed with a
+// version byte: the high nibble is the format (keyHandleFormatDeviceKey) and
+// the low nibble holds flags. Key handles with a bare 20 byte seed were
+// created by versions without a device key ("legacy").
+//
+// In the device key format, the seed is HMACed with the device key before
+// deriving the primary key, so evicting the device key invalidates the
+// credential. Its keys also have noDA set: they have an empty authValue, so
 // dictionary attack protection doesn't protect anything, and without noDA
 // they can't be used while the TPM is in lockout, e.g. after wrong PIN
-// guesses. Key handles with a bare 20 byte seed were created without noDA.
-// The flag changes the primary key template, so it can't be changed for
-// existing key handles.
+// guesses.
 const (
-	keyHandleVersionNoDA = 0x01
-	// like keyHandleVersionNoDA, for credentials created with the
-	// hmac-secret extension
-	keyHandleVersionHMACSecret = 0x02
+	keyHandleFormatDeviceKey = 0x10
+	keyHandleFormatMask      = 0xF0
+
+	// the credential was created with the hmac-secret extension
+	keyHandleFlagHMACSecret = 0x01
+	// the credential is discoverable (a passkey)
+	keyHandleFlagDiscoverable = 0x02
+	keyHandleFlagsMask        = keyHandleFlagHMACSecret | keyHandleFlagDiscoverable
 )
 
 type keyHandleFlags struct {
-	noDA       bool
-	hmacSecret bool
+	legacy       bool
+	hmacSecret   bool
+	discoverable bool
 }
 
-// parseSeed splits the seed field of a key handle into the HKDF seed and
-// the key handle flags.
+func (f keyHandleFlags) versionByte() byte {
+	b := byte(keyHandleFormatDeviceKey)
+	if f.hmacSecret {
+		b |= keyHandleFlagHMACSecret
+	}
+	if f.discoverable {
+		b |= keyHandleFlagDiscoverable
+	}
+	return b
+}
+
+// parseSeed splits the seed field of a key handle into the seed and the key
+// handle flags.
 func parseSeed(field []byte) (seed []byte, flags keyHandleFlags, err error) {
 	if len(field) == seedSizeBytes {
-		return field, flags, nil
+		return field, keyHandleFlags{legacy: true}, nil
 	}
 	if len(field) == seedSizeBytes+1 {
-		switch field[0] {
-		case keyHandleVersionNoDA:
-			return field[1:], keyHandleFlags{noDA: true}, nil
-		case keyHandleVersionHMACSecret:
-			return field[1:], keyHandleFlags{noDA: true, hmacSecret: true}, nil
+		v := field[0]
+		if v&keyHandleFormatMask == keyHandleFormatDeviceKey && v&^(keyHandleFormatMask|keyHandleFlagsMask) == 0 {
+			return field[1:], keyHandleFlags{
+				hmacSecret:   v&keyHandleFlagHMACSecret != 0,
+				discoverable: v&keyHandleFlagDiscoverable != 0,
+			}, nil
 		}
 	}
 	return nil, flags, fmt.Errorf("invalid key handle seed")
+}
+
+// IsDiscoverable reports whether keyHandle was created as a discoverable
+// credential. It doesn't check that the key handle is valid.
+func (t *TPM) IsDiscoverable(keyHandle []byte) bool {
+	_, _, _, flags, err := decodeKeyHandle(keyHandle)
+	return err == nil && flags.discoverable
 }
 
 var errInvalidHandle = errors.New("invalid key handle")
@@ -150,6 +215,18 @@ func decodeKeyHandle(keyHandle []byte) (private, public, seed []byte, flags keyH
 		return nil, nil, nil, flags, errInvalidHandle
 	}
 	return private, public, seed, flags, nil
+}
+
+// primarySeed returns the seed of the primary key template for a key handle
+// seed.
+func (t *TPM) primarySeed(rw io.ReadWriter, seed []byte, flags keyHandleFlags) ([]byte, error) {
+	if flags.legacy {
+		if t.legacyDisabled {
+			return nil, errors.New("key handles from before the last reset are disabled")
+		}
+		return seed, nil
+	}
+	return t.deviceHMAC(transport.FromReadWriter(rw), append([]byte("tpm-fido credential seed"), seed...))
 }
 
 func primaryKeyTmpl(seed, applicationParam []byte, noDA bool) tpm2.Public {
@@ -218,8 +295,8 @@ func (t *TPM) Counter() (uint32, error) {
 
 // Register a new key with the TPM for the given applicationParam.
 // RegisterKey returns the KeyHandle or an error. hmacSecret enables the
-// hmac-secret extension for the key.
-func (t *TPM) RegisterKey(applicationParam []byte, hmacSecret bool) ([]byte, *big.Int, *big.Int, error) {
+// hmac-secret extension for the key; discoverable marks it as a passkey.
+func (t *TPM) RegisterKey(applicationParam []byte, hmacSecret, discoverable bool) ([]byte, *big.Int, *big.Int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -230,13 +307,14 @@ func (t *TPM) RegisterKey(applicationParam []byte, hmacSecret bool) ([]byte, *bi
 	defer tpm.Close()
 
 	randSeed := mustRand(seedSizeBytes)
-	version := byte(keyHandleVersionNoDA)
-	if hmacSecret {
-		version = keyHandleVersionHMACSecret
-	}
-	seedField := append([]byte{version}, randSeed...)
+	flags := keyHandleFlags{hmacSecret: hmacSecret, discoverable: discoverable}
+	seedField := append([]byte{flags.versionByte()}, randSeed...)
 
-	primaryTmpl := primaryKeyTmpl(randSeed, applicationParam, true)
+	pSeed, err := t.primarySeed(tpm, randSeed, flags)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	primaryTmpl := primaryKeyTmpl(pSeed, applicationParam, true)
 
 	childTmpl := tpm2.Public{
 		Type:    tpm2.AlgECC,
@@ -310,7 +388,11 @@ func (t *TPM) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, erro
 		return nil, err
 	}
 
-	srkTemplate := primaryKeyTmpl(seed, applicationParam, flags.noDA)
+	pSeed, err := t.primarySeed(tpm, seed, flags)
+	if err != nil {
+		return nil, err
+	}
+	srkTemplate := primaryKeyTmpl(pSeed, applicationParam, !flags.legacy)
 
 	parentHandle, _, err := tpm2.CreatePrimary(tpm, tpm2.HandleOwner, tpm2.PCRSelection{}, "", "", srkTemplate)
 	if err != nil {

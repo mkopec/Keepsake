@@ -31,9 +31,13 @@ func (m *Mem) Counter() (uint32, error) {
 	return m.signCounter, nil
 }
 
+// Key handles start with a flags byte, which is authenticated with the
+// wrapped key.
+const flagDiscoverable = 0x01
+
 // RegisterKey creates a new key. hmac-secret is enabled for every key, so
 // hmacSecret is ignored.
-func (m *Mem) RegisterKey(applicationParam []byte, hmacSecret bool) ([]byte, *big.Int, *big.Int, error) {
+func (m *Mem) RegisterKey(applicationParam []byte, hmacSecret, discoverable bool) ([]byte, *big.Int, *big.Int, error) {
 	curve := elliptic.P256()
 
 	childPrivateKey, x, y, err := elliptic.GenerateKey(curve, rand.Reader)
@@ -52,10 +56,16 @@ func (m *Mem) RegisterKey(applicationParam []byte, hmacSecret bool) ([]byte, *bi
 		return nil, nil, nil, fmt.Errorf("chacha NewX err: %w", err)
 	}
 
-	nonce := mustRand(chacha20poly1305.NonceSizeX)
-	encryptedChildPrivateKey := aead.Seal(nil, nonce, childPrivateKey, sum)
+	var flags byte
+	if discoverable {
+		flags |= flagDiscoverable
+	}
 
-	keyHandle := make([]byte, 0, len(nonce)+len(encryptedChildPrivateKey))
+	nonce := mustRand(chacha20poly1305.NonceSizeX)
+	encryptedChildPrivateKey := aead.Seal(nil, nonce, childPrivateKey, append(sum, flags))
+
+	keyHandle := make([]byte, 0, 1+len(nonce)+len(encryptedChildPrivateKey))
+	keyHandle = append(keyHandle, flags)
 	keyHandle = append(keyHandle, nonce...)
 	keyHandle = append(keyHandle, encryptedChildPrivateKey...)
 
@@ -72,11 +82,12 @@ func (m *Mem) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, erro
 		panic(err)
 	}
 
-	if len(keyHandle) < chacha20poly1305.NonceSizeX {
+	if len(keyHandle) < 1+chacha20poly1305.NonceSizeX {
 		return nil, fmt.Errorf("incorrect size for key handle: %d smaller than nonce)", len(keyHandle))
 	}
-	nonce := keyHandle[:chacha20poly1305.NonceSizeX]
-	cipherText := keyHandle[chacha20poly1305.NonceSizeX:]
+	flags := keyHandle[0]
+	nonce := keyHandle[1 : 1+chacha20poly1305.NonceSizeX]
+	cipherText := keyHandle[1+chacha20poly1305.NonceSizeX:]
 
 	metadata := []byte("fido_wrapping_key")
 	metadata = append(metadata, applicationParam[:]...)
@@ -84,7 +95,7 @@ func (m *Mem) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, erro
 	h.Write(metadata)
 	sum := h.Sum(nil)
 
-	childPrivateKey, err := aead.Open(nil, nonce, cipherText, sum)
+	childPrivateKey, err := aead.Open(nil, nonce, cipherText, append(sum, flags))
 	if err != nil {
 		return nil, fmt.Errorf("open child private key err: %w", err)
 	}
@@ -146,4 +157,23 @@ func (m *Mem) HMACSecret(keyHandle, rpIDHash, uvPinHash []byte) ([]byte, error) 
 	mac.Write(rpIDHash)
 	mac.Write(credHash[:])
 	return mac.Sum(nil), nil
+}
+
+func (m *Mem) IsDiscoverable(keyHandle []byte) bool {
+	return len(keyHandle) > 0 && keyHandle[0]&flagDiscoverable != 0
+}
+
+func (m *Mem) StoreKey() ([]byte, error) {
+	mac := hmac.New(sha256.New, m.masterPrivateKey)
+	mac.Write([]byte("memory passkey store key"))
+	return mac.Sum(nil), nil
+}
+
+// Reset replaces the master key, invalidating every credential, and
+// removes the PIN.
+func (m *Mem) Reset() error {
+	m.masterPrivateKey = mustRand(chacha20poly1305.KeySize)
+	m.pinHash = nil
+	m.pinRetries = 0
+	return nil
 }

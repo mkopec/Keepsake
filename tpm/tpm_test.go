@@ -8,23 +8,30 @@ import (
 )
 
 func TestParseSeed(t *testing.T) {
-	legacy := bytes.Repeat([]byte{7}, seedSizeBytes)
+	seed := bytes.Repeat([]byte{7}, seedSizeBytes)
 	cases := []struct {
 		field []byte
 		want  keyHandleFlags
 	}{
-		{legacy, keyHandleFlags{}},
-		{append([]byte{keyHandleVersionNoDA}, legacy...), keyHandleFlags{noDA: true}},
-		{append([]byte{keyHandleVersionHMACSecret}, legacy...), keyHandleFlags{noDA: true, hmacSecret: true}},
+		{seed, keyHandleFlags{legacy: true}},
+		{append([]byte{0x10}, seed...), keyHandleFlags{}},
+		{append([]byte{0x11}, seed...), keyHandleFlags{hmacSecret: true}},
+		{append([]byte{0x12}, seed...), keyHandleFlags{discoverable: true}},
+		{append([]byte{0x13}, seed...), keyHandleFlags{hmacSecret: true, discoverable: true}},
 	}
 	for _, c := range cases {
-		seed, flags, err := parseSeed(c.field)
-		if err != nil || flags != c.want || !bytes.Equal(seed, legacy) {
-			t.Fatalf("seed %x: got %x %+v %v", c.field, seed, flags, err)
+		got, flags, err := parseSeed(c.field)
+		if err != nil || flags != c.want || !bytes.Equal(got, seed) {
+			t.Fatalf("seed %x: got %x %+v %v", c.field, got, flags, err)
+		}
+		if !flags.legacy && flags.versionByte() != c.field[0] {
+			t.Fatalf("versionByte %x != %x", flags.versionByte(), c.field[0])
 		}
 	}
 
-	for _, bad := range [][]byte{nil, legacy[:19], append([]byte{0x03}, legacy...), append(legacy, 1, 2)} {
+	// 0x01 and 0x02 were used by unreleased versions before the device key
+	for _, bad := range [][]byte{nil, seed[:19], append([]byte{0x01}, seed...), append([]byte{0x02}, seed...),
+		append([]byte{0x14}, seed...), append([]byte{0x20}, seed...), append(seed, 1, 2)} {
 		if _, _, err := parseSeed(bad); err == nil {
 			t.Errorf("accepted invalid seed %x", bad)
 		}

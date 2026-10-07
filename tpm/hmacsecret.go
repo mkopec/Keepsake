@@ -18,16 +18,16 @@ var ErrHMACSecretNotEnabled = errors.New("hmac-secret not enabled for credential
 // CredRandomWithUV in CTAP 2.1) by HMACing the credential with one of two
 // TPM keys:
 //
-//   - The no-UV key is a keyed hash primary key in the owner hierarchy. It is
-//     derived from the owner seed, so it never leaves the TPM and is lost
-//     when the TPM is cleared, but anyone who can use the TPM can recreate
-//     it.
-//   - The UV key is an ordinary keyed hash key whose authValue is the PIN
-//     hash, stored in the PIN index. Without the PIN, the secrets derived
-//     with it can't be computed even with direct access to the TPM, and
-//     guessing the PIN counts towards the TPM's dictionary attack lockout.
-func hmacKeyTemplate(primary bool) tpm2.TPMTPublic {
-	pub := tpm2.TPMTPublic{
+//   - Without user verification, the device key. Anyone who can use the TPM
+//     can use it, so they can compute these secrets; evicting it
+//     (authenticatorReset) destroys them.
+//   - With user verification, the UV key: an ordinary keyed hash key whose
+//     authValue is the PIN hash, stored in the PIN index. Without the PIN,
+//     the secrets derived with it can't be computed even with direct access
+//     to the TPM, and guessing the PIN counts towards the TPM's dictionary
+//     attack lockout.
+func hmacKeyTemplate(noDA bool) tpm2.TPMTPublic {
+	return tpm2.TPMTPublic{
 		Type:    tpm2.TPMAlgKeyedHash,
 		NameAlg: tpm2.TPMAlgSHA256,
 		ObjectAttributes: tpm2.TPMAObject{
@@ -36,9 +36,7 @@ func hmacKeyTemplate(primary bool) tpm2.TPMTPublic {
 			SensitiveDataOrigin: true,
 			UserWithAuth:        true,
 			SignEncrypt:         true,
-			// The primary key has an empty authValue. The UV key is
-			// protected by the PIN, so it must count towards lockout.
-			NoDA: primary,
+			NoDA:                noDA,
 		},
 		Parameters: tpm2.NewTPMUPublicParms(tpm2.TPMAlgKeyedHash,
 			&tpm2.TPMSKeyedHashParms{
@@ -49,12 +47,6 @@ func hmacKeyTemplate(primary bool) tpm2.TPMTPublic {
 				},
 			}),
 	}
-	if primary {
-		// The unique field makes the derived key specific to tpm-fido.
-		label := sha256.Sum256([]byte("tpm-fido hmac-secret"))
-		pub.Unique = tpm2.NewTPMUPublicID(tpm2.TPMAlgKeyedHash, &tpm2.TPM2BDigest{Buffer: label[:]})
-	}
-	return pub
 }
 
 func createSRK(tpm transport.TPM) (*tpm2.CreatePrimaryResponse, error) {
@@ -176,7 +168,7 @@ func (t *TPM) HMACSecret(keyHandle, rpIDHash, uvPinHash []byte) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	if !flags.hmacSecret {
+	if flags.legacy || !flags.hmacSecret {
 		return nil, ErrHMACSecretNotEnabled
 	}
 
@@ -186,38 +178,31 @@ func (t *TPM) HMACSecret(keyHandle, rpIDHash, uvPinHash []byte) ([]byte, error) 
 
 	var out []byte
 	err = t.withTPM(func(tpm transport.TPM) error {
-		var key tpm2.AuthHandle
 		if uvPinHash == nil {
-			rsp, err := tpm2.CreatePrimary{
-				PrimaryHandle: ownerAuth,
-				InPublic:      tpm2.New2B(hmacKeyTemplate(true)),
-			}.Execute(tpm)
-			if err != nil {
-				return fmt.Errorf("create hmac-secret key err: %w", err)
-			}
-			defer flush(tpm, rsp.ObjectHandle)
-			key = tpm2.AuthHandle{Handle: rsp.ObjectHandle, Name: rsp.Name, Auth: tpm2.PasswordAuth(nil)}
-		} else {
-			name, err := t.pinIndexWritten(tpm)
-			if err != nil {
-				return err
-			}
-			blob, err := t.readUVKeyBlob(tpm, name)
-			if err != nil {
-				return err
-			}
-			srk, err := createSRK(tpm)
-			if err != nil {
-				return err
-			}
-			defer flush(tpm, srk.ObjectHandle)
-			rsp, err := loadUVKey(tpm, srk, blob)
-			if err != nil {
-				return err
-			}
-			defer flush(tpm, rsp.ObjectHandle)
-			key = tpm2.AuthHandle{Handle: rsp.ObjectHandle, Name: rsp.Name, Auth: tpm2.PasswordAuth(uvPinHash)}
+			var err error
+			out, err = t.deviceHMAC(tpm, msg)
+			return err
 		}
+
+		name, err := t.pinIndexWritten(tpm)
+		if err != nil {
+			return err
+		}
+		blob, err := t.readUVKeyBlob(tpm, name)
+		if err != nil {
+			return err
+		}
+		srk, err := createSRK(tpm)
+		if err != nil {
+			return err
+		}
+		defer flush(tpm, srk.ObjectHandle)
+		uvKey, err := loadUVKey(tpm, srk, blob)
+		if err != nil {
+			return err
+		}
+		defer flush(tpm, uvKey.ObjectHandle)
+		key := tpm2.AuthHandle{Handle: uvKey.ObjectHandle, Name: uvKey.Name, Auth: tpm2.PasswordAuth(uvPinHash)}
 
 		rsp, err := tpm2.Hmac{
 			Handle:  key,
