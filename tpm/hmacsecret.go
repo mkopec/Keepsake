@@ -65,7 +65,7 @@ func flush(tpm transport.TPM, h tpm2.TPMHandle) {
 }
 
 func srkParent(srk *tpm2.CreatePrimaryResponse) tpm2.AuthHandle {
-	return tpm2.AuthHandle{Handle: srk.ObjectHandle, Name: srk.Name, Auth: tpm2.PasswordAuth(nil)}
+	return parentAuth(srk)
 }
 
 // A UV key blob is the key's private area followed by its public area, each
@@ -103,32 +103,34 @@ func decodeUVKeyBlob(blob []byte) (tpm2.TPM2BPrivate, tpm2.TPM2BPublic, error) {
 	return tpm2.TPM2BPrivate{Buffer: private}, tpm2.BytesAs2B[tpm2.TPMTPublic](public), nil
 }
 
-func createUVKey(tpm transport.TPM, srk *tpm2.CreatePrimaryResponse, pinHash []byte) ([]byte, error) {
+// createUVKey creates a UV key. The PIN hash is its first parameter, which
+// is encrypted.
+func createUVKey(sec *secure, pinHash []byte) ([]byte, error) {
 	rsp, err := tpm2.Create{
-		ParentHandle: srkParent(srk),
+		ParentHandle: srkParent(sec.srk),
 		InSensitive: tpm2.TPM2BSensitiveCreate{
 			Sensitive: &tpm2.TPMSSensitiveCreate{
 				UserAuth: tpm2.TPM2BAuth{Buffer: pinHash},
 			},
 		},
 		InPublic: tpm2.New2B(hmacKeyTemplate(false)),
-	}.Execute(tpm)
+	}.Execute(sec.tpm, sec.encrypt(encryptIn))
 	if err != nil {
 		return nil, fmt.Errorf("create UV key err: %w", err)
 	}
 	return encodeUVKeyBlob(rsp.OutPrivate, rsp.OutPublic.Bytes())
 }
 
-func loadUVKey(tpm transport.TPM, srk *tpm2.CreatePrimaryResponse, blob []byte) (*tpm2.LoadResponse, error) {
+func loadUVKey(sec *secure, blob []byte) (*tpm2.LoadResponse, error) {
 	private, public, err := decodeUVKeyBlob(blob)
 	if err != nil {
 		return nil, err
 	}
 	rsp, err := tpm2.Load{
-		ParentHandle: srkParent(srk),
+		ParentHandle: srkParent(sec.srk),
 		InPrivate:    private,
 		InPublic:     public,
-	}.Execute(tpm)
+	}.Execute(sec.tpm)
 	if err != nil {
 		return nil, fmt.Errorf("load UV key err: %w", err)
 	}
@@ -137,18 +139,19 @@ func loadUVKey(tpm transport.TPM, srk *tpm2.CreatePrimaryResponse, blob []byte) 
 
 // changeUVKeyAuth re-wraps the UV key with a new PIN hash, keeping the key
 // itself (and so the secrets derived with it).
-func changeUVKeyAuth(tpm transport.TPM, srk *tpm2.CreatePrimaryResponse, blob, oldPinHash, newPinHash []byte) ([]byte, error) {
-	key, err := loadUVKey(tpm, srk, blob)
+func changeUVKeyAuth(sec *secure, blob, oldPinHash, newPinHash []byte) ([]byte, error) {
+	key, err := loadUVKey(sec, blob)
 	if err != nil {
 		return nil, err
 	}
-	defer flush(tpm, key.ObjectHandle)
+	defer flush(sec.tpm, key.ObjectHandle)
 
+	// the new PIN hash is the first parameter, encrypted
 	rsp, err := tpm2.ObjectChangeAuth{
-		ObjectHandle: tpm2.AuthHandle{Handle: key.ObjectHandle, Name: key.Name, Auth: tpm2.PasswordAuth(oldPinHash)},
-		ParentHandle: tpm2.NamedHandle{Handle: srk.ObjectHandle, Name: srk.Name},
+		ObjectHandle: tpm2.AuthHandle{Handle: key.ObjectHandle, Name: key.Name, Auth: sec.auth(oldPinHash, encryptIn)},
+		ParentHandle: tpm2.NamedHandle{Handle: sec.srk.ObjectHandle, Name: sec.srk.Name},
 		NewAuth:      tpm2.TPM2BAuth{Buffer: newPinHash},
-	}.Execute(tpm)
+	}.Execute(sec.tpm)
 	if err != nil {
 		return nil, fmt.Errorf("change UV key auth err: %w", err)
 	}
@@ -164,11 +167,11 @@ func changeUVKeyAuth(tpm transport.TPM, srk *tpm2.CreatePrimaryResponse, blob, o
 // with hmac-secret, and ErrLockout if the TPM refuses the PIN hash because
 // it is in dictionary attack lockout.
 func (t *TPM) HMACSecret(keyHandle, rpIDHash, uvPinHash []byte) ([]byte, error) {
-	_, _, _, flags, err := decodeKeyHandle(keyHandle)
+	flags, err := keyHandleInfo(keyHandle)
 	if err != nil {
 		return nil, err
 	}
-	if flags.legacy || !flags.hmacSecret {
+	if flags.legacy || !flags.HMACSecret {
 		return nil, ErrHMACSecretNotEnabled
 	}
 
@@ -180,29 +183,22 @@ func (t *TPM) HMACSecret(keyHandle, rpIDHash, uvPinHash []byte) ([]byte, error) 
 	err = t.withTPM(func(tpm transport.TPM) error {
 		if uvPinHash == nil {
 			var err error
-			out, err = t.deviceHMAC(tpm, msg)
+			out, err = t.deviceHMAC(tpm, msg, true)
 			return err
 		}
 
-		name, err := t.pinIndexWritten(tpm)
+		sec, err := t.secure(tpm)
 		if err != nil {
 			return err
 		}
-		blob, err := t.readUVKeyBlob(tpm, name)
-		if err != nil {
-			return err
-		}
-		srk, err := createSRK(tpm)
-		if err != nil {
-			return err
-		}
-		defer flush(tpm, srk.ObjectHandle)
-		uvKey, err := loadUVKey(tpm, srk, blob)
+		defer sec.close()
+		uvKey, err := t.loadUVKeyFromIndex(tpm, sec)
 		if err != nil {
 			return err
 		}
 		defer flush(tpm, uvKey.ObjectHandle)
-		key := tpm2.AuthHandle{Handle: uvKey.ObjectHandle, Name: uvKey.Name, Auth: tpm2.PasswordAuth(uvPinHash)}
+		// the HMAC output is the first response parameter, encrypted
+		key := tpm2.AuthHandle{Handle: uvKey.ObjectHandle, Name: uvKey.Name, Auth: sec.auth(uvPinHash, encryptOut)}
 
 		rsp, err := tpm2.Hmac{
 			Handle:  key,
@@ -218,4 +214,45 @@ func (t *TPM) HMACSecret(keyHandle, rpIDHash, uvPinHash []byte) ([]byte, error) 
 		return nil
 	})
 	return out, err
+}
+
+// loadUVKeyFromIndex loads the UV key stored in the PIN index.
+func (t *TPM) loadUVKeyFromIndex(tpm transport.TPM, sec *secure) (*tpm2.LoadResponse, error) {
+	name, err := t.pinIndexWritten(tpm)
+	if err != nil {
+		return nil, err
+	}
+	blob, err := t.readUVKeyBlob(tpm, name)
+	if err != nil {
+		return nil, err
+	}
+	return loadUVKey(sec, blob)
+}
+
+// uvKeyName returns the name of the UV key, or ErrNoPIN if no PIN is set.
+func (t *TPM) uvKeyName(tpm transport.TPM) (tpm2.TPM2BName, error) {
+	name, _, written, err := t.pinIndex(tpm)
+	if err != nil {
+		return tpm2.TPM2BName{}, err
+	}
+	if !written {
+		return tpm2.TPM2BName{}, ErrNoPIN
+	}
+	blob, err := t.readUVKeyBlob(tpm, name)
+	if err != nil {
+		return tpm2.TPM2BName{}, err
+	}
+	_, public, err := decodeUVKeyBlob(blob)
+	if err != nil {
+		return tpm2.TPM2BName{}, err
+	}
+	pub, err := public.Contents()
+	if err != nil {
+		return tpm2.TPM2BName{}, err
+	}
+	n, err := tpm2.ObjectName(pub)
+	if err != nil {
+		return tpm2.TPM2BName{}, err
+	}
+	return *n, nil
 }

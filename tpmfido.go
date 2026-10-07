@@ -61,10 +61,16 @@ type server struct {
 }
 
 type Signer interface {
-	RegisterKey(applicationParam []byte, hmacSecret, discoverable bool) ([]byte, *big.Int, *big.Int, error)
-	// IsDiscoverable reports whether keyHandle was created as a passkey.
-	IsDiscoverable(keyHandle []byte) bool
-	SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, error)
+	RegisterKey(applicationParam []byte, opts tpm.KeyOptions) ([]byte, *big.Int, *big.Int, error)
+	// KeyInfo returns the properties a key handle was created with,
+	// without checking that it is valid.
+	KeyInfo(keyHandle []byte) (tpm.KeyOptions, error)
+	// CheckKey returns nil if keyHandle is a valid credential for
+	// applicationParam.
+	CheckKey(keyHandle, applicationParam []byte) error
+	// SignASN1 signs with a credential. Credentials with credProtect
+	// level 3 need uvPinHash, the hash of the verified PIN.
+	SignASN1(keyHandle, applicationParam, digest, uvPinHash []byte) ([]byte, error)
 	Counter() (uint32, error)
 	// HMACSecret returns the hmac-secret CredRandom of a credential, the
 	// one used with user verification if uvPinHash is set.
@@ -78,29 +84,6 @@ type Signer interface {
 func newServer() *server {
 	s := server{
 		pin: newPINState(),
-	}
-	if *backend == "tpm" {
-		signer, err := tpm.New(*device, tpm.Handles{
-			CounterIndex: uint32(*counterIndex),
-			PINIndex:     uint32(*pinIndex),
-			StateIndex:   uint32(*stateIndex),
-			DeviceKey:    uint32(*deviceKeyHandle),
-		})
-		if errors.Is(err, fs.ErrPermission) {
-			log.Fatalf("%s: add your user to the group owning %s (usually tss) and log in again", err, *device)
-		}
-		if err != nil {
-			log.Fatalf("TPM: %s", err)
-		}
-		s.signer = signer
-		s.pins = signer
-	} else if *backend == "memory" {
-		signer, err := memory.New()
-		if err != nil {
-			log.Fatal(err)
-		}
-		s.signer = signer
-		s.pins = signer
 	}
 
 	path := *passkeyStore
@@ -117,12 +100,56 @@ func newServer() *server {
 			log.Fatal(err)
 		}
 	}
+
+	if *backend == "tpm" {
+		signer, err := tpm.New(*device, tpm.Handles{
+			CounterIndex: uint32(*counterIndex),
+			PINIndex:     uint32(*pinIndex),
+			StateIndex:   uint32(*stateIndex),
+			DeviceKey:    uint32(*deviceKeyHandle),
+			SRKNameFile:  filepath.Join(filepath.Dir(path), "srk-name"),
+		})
+		if errors.Is(err, fs.ErrPermission) {
+			log.Fatalf("%s: add your user to the group owning %s (usually tss) and log in again", err, *device)
+		}
+		if err != nil {
+			log.Fatalf("TPM: %s", err)
+		}
+		warnLockout(signer)
+		s.signer = signer
+		s.pins = signer
+	} else if *backend == "memory" {
+		signer, err := memory.New()
+		if err != nil {
+			log.Fatal(err)
+		}
+		s.signer = signer
+		s.pins = signer
+	}
 	s.passkeys = s.newPasskeyStore(path)
 
 	if err := s.setupDesktop(); err != nil {
 		log.Fatal(err)
 	}
 	return &s
+}
+
+// warnLockout warns if the TPM's dictionary attack protection can't
+// protect the PIN.
+func warnLockout(t *tpm.TPM) {
+	st, err := t.LockoutStatus()
+	if err != nil {
+		log.Printf("can't read the TPM's dictionary attack settings: %s", err)
+		return
+	}
+	if !st.LockoutAuthSet {
+		log.Printf("WARNING: the TPM's lockout authorization is not set. Anyone who can use the TPM " +
+			"can reset its dictionary attack counter and guess the PIN without limit. Set it with " +
+			"`tpm2_changeauth -c lockout <password>` and keep the password safe.")
+	}
+	if st.MaxAuthFail == 0 || st.MaxAuthFail > 32 {
+		log.Printf("WARNING: the TPM allows %d wrong PINs before locking out", st.MaxAuthFail)
+	}
 }
 
 func (s *server) run() {
@@ -198,7 +225,7 @@ func (s *server) handleAuthenticate(parentCtx context.Context, token *fidohid.So
 	keyHandle := req.Authenticate.KeyHandle
 	appParam := req.Authenticate.ApplicationParam[:]
 
-	if !s.ownsCredential(keyHandle, appParam) {
+	if !s.ownsCredential(keyHandle, appParam, false) {
 		log.Printf("invalid key handle (size: %d)", len(keyHandle))
 
 		err := token.WriteResponse(parentCtx, evt, nil, statuscode.WrongData)
@@ -292,7 +319,7 @@ func (s *server) handleAuthenticate(parentCtx context.Context, token *fidohid.So
 	sigHash := sha256.New()
 	sigHash.Write(toSign.Bytes())
 
-	sig, err := s.signer.SignASN1(keyHandle, appParam, sigHash.Sum(nil))
+	sig, err := s.signer.SignASN1(keyHandle, appParam, sigHash.Sum(nil), nil)
 	if err != nil {
 		log.Fatalf("auth sign err: %s", err)
 	}
@@ -354,7 +381,7 @@ func (s *server) handleRegister(parentCtx context.Context, token *fidohid.SoftTo
 func (s *server) registerSite(ctx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent) {
 	req := evt.Req
 
-	keyHandle, x, y, err := s.signer.RegisterKey(req.Register.ApplicationParam[:], false, false)
+	keyHandle, x, y, err := s.signer.RegisterKey(req.Register.ApplicationParam[:], tpm.KeyOptions{})
 	if err != nil {
 		log.Printf("RegisteKey err: %s", err)
 		return

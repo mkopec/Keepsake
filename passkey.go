@@ -89,7 +89,9 @@ func (s *server) storedPasskey(credID, rpIDHash []byte) (*passkeys.Credential, e
 }
 
 // discoverablePasskeys returns the usable passkeys for rpID, newest first.
-func (s *server) discoverablePasskeys(rpID string) ([]passkeys.Credential, error) {
+// Without user verification, passkeys with credProtect level 2 or 3 aren't
+// discoverable.
+func (s *server) discoverablePasskeys(rpID string, uv bool) ([]passkeys.Credential, error) {
 	creds, err := s.loadPasskeys()
 	if err != nil {
 		return nil, err
@@ -100,7 +102,13 @@ func (s *server) discoverablePasskeys(rpID string) ([]passkeys.Credential, error
 	// passkeys created in the same second newest first too.
 	for i := len(creds) - 1; i >= 0; i-- {
 		c := creds[i]
-		if c.RPID == rpID && s.ownsCredential(c.ID, rpIDHash[:]) {
+		if c.RPID != rpID {
+			continue
+		}
+		if info, err := s.signer.KeyInfo(c.ID); err != nil || (!uv && info.CredProtect >= 2) {
+			continue
+		}
+		if s.ownsCredential(c.ID, rpIDHash[:], uv) {
 			out = append(out, c)
 		}
 	}

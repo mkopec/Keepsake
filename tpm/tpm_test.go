@@ -9,32 +9,60 @@ import (
 
 func TestParseSeed(t *testing.T) {
 	seed := bytes.Repeat([]byte{7}, seedSizeBytes)
+	flags := func(o KeyOptions) keyHandleFlags { return keyHandleFlags{KeyOptions: o} }
 	cases := []struct {
 		field []byte
 		want  keyHandleFlags
 	}{
 		{seed, keyHandleFlags{legacy: true}},
-		{append([]byte{0x10}, seed...), keyHandleFlags{}},
-		{append([]byte{0x11}, seed...), keyHandleFlags{hmacSecret: true}},
-		{append([]byte{0x12}, seed...), keyHandleFlags{discoverable: true}},
-		{append([]byte{0x13}, seed...), keyHandleFlags{hmacSecret: true, discoverable: true}},
+		{append([]byte{0x20}, seed...), flags(KeyOptions{CredProtect: 1})},
+		{append([]byte{0x21}, seed...), flags(KeyOptions{HMACSecret: true, CredProtect: 1})},
+		{append([]byte{0x22}, seed...), flags(KeyOptions{Discoverable: true, CredProtect: 1})},
+		{append([]byte{0x26}, seed...), flags(KeyOptions{Discoverable: true, CredProtect: 2})},
+		{append([]byte{0x2b}, seed...), flags(KeyOptions{HMACSecret: true, Discoverable: true, CredProtect: 3})},
 	}
 	for _, c := range cases {
-		got, flags, err := parseSeed(c.field)
-		if err != nil || flags != c.want || !bytes.Equal(got, seed) {
-			t.Fatalf("seed %x: got %x %+v %v", c.field, got, flags, err)
+		got, f, err := parseSeed(c.field)
+		if err != nil || f != c.want || !bytes.Equal(got, seed) {
+			t.Fatalf("seed %x: got %x %+v %v", c.field, got, f, err)
 		}
-		if !flags.legacy && flags.versionByte() != c.field[0] {
-			t.Fatalf("versionByte %x != %x", flags.versionByte(), c.field[0])
+		if !f.legacy && f.versionByte() != c.field[0] {
+			t.Fatalf("versionByte %x != %x", f.versionByte(), c.field[0])
 		}
 	}
 
-	// 0x01 and 0x02 were used by unreleased versions before the device key
-	for _, bad := range [][]byte{nil, seed[:19], append([]byte{0x01}, seed...), append([]byte{0x02}, seed...),
-		append([]byte{0x14}, seed...), append([]byte{0x20}, seed...), append(seed, 1, 2)} {
+	// 0x1X didn't authenticate the flags and is no longer accepted; 0x2c
+	// has both credProtect flags
+	for _, bad := range [][]byte{nil, seed[:19], append([]byte{0x01}, seed...), append([]byte{0x12}, seed...),
+		append([]byte{0x2c}, seed...), append([]byte{0x30}, seed...), append(seed, 1, 2)} {
 		if _, _, err := parseSeed(bad); err == nil {
 			t.Errorf("accepted invalid seed %x", bad)
 		}
+	}
+}
+
+// The primary template of legacy key handles must encode exactly as the
+// legacy go-tpm API did.
+func TestPrimaryTemplateMatchesLegacy(t *testing.T) {
+	seed := bytes.Repeat([]byte{7}, seedSizeBytes)
+	app := bytes.Repeat([]byte{9}, 32)
+	for _, noDA := range []bool{false, true} {
+		got := tpm2.Marshal(primaryTemplate(seed, app, noDA))
+		want, err := legacyPrimaryTemplate(seed, app, noDA).Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("noDA=%v:\ngot  %x\nwant %x", noDA, got, want)
+		}
+	}
+}
+
+func TestPinPolicyDependsOnUVKey(t *testing.T) {
+	a, _ := pinPolicy(tpm2.TPM2BName{Buffer: []byte{0, 0x0b, 1}})
+	b, _ := pinPolicy(tpm2.TPM2BName{Buffer: []byte{0, 0x0b, 2}})
+	if len(a) != 32 || bytes.Equal(a, b) {
+		t.Fatalf("policies %x %x", a, b)
 	}
 }
 

@@ -201,6 +201,9 @@ func cbcDecrypt(key, iv, ciphertext []byte) []byte {
 // ExtHMACSecret is the identifier of the hmac-secret extension.
 const ExtHMACSecret = "hmac-secret"
 
+// ExtCredProtect is the identifier of the credProtect extension.
+const ExtCredProtect = "credProtect"
+
 // HMACSecretInput is the hmac-secret extension input of GetAssertion.
 type HMACSecretInput struct {
 	KeyAgreement *COSEKey `cbor:"1,keyasint"`

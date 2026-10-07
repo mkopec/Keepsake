@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/psanford/tpm-fido/tpm"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -32,12 +33,20 @@ func (m *Mem) Counter() (uint32, error) {
 }
 
 // Key handles start with a flags byte, which is authenticated with the
-// wrapped key.
-const flagDiscoverable = 0x01
+// wrapped key: flagDiscoverable and the credProtect level in the next two
+// bits.
+const (
+	flagDiscoverable = 0x01
+	credProtectShift = 1
+	credProtectBits  = 0x06
+)
 
 // RegisterKey creates a new key. hmac-secret is enabled for every key, so
-// hmacSecret is ignored.
-func (m *Mem) RegisterKey(applicationParam []byte, hmacSecret, discoverable bool) ([]byte, *big.Int, *big.Int, error) {
+// opts.HMACSecret is ignored. Level 3 credProtect is enforced in software.
+func (m *Mem) RegisterKey(applicationParam []byte, opts tpm.KeyOptions) ([]byte, *big.Int, *big.Int, error) {
+	if opts.CredProtect == 3 && m.pinHash == nil {
+		return nil, nil, nil, tpm.ErrNoPIN
+	}
 	curve := elliptic.P256()
 
 	childPrivateKey, x, y, err := elliptic.GenerateKey(curve, rand.Reader)
@@ -57,8 +66,11 @@ func (m *Mem) RegisterKey(applicationParam []byte, hmacSecret, discoverable bool
 	}
 
 	var flags byte
-	if discoverable {
+	if opts.Discoverable {
 		flags |= flagDiscoverable
+	}
+	if opts.CredProtect > 1 {
+		flags |= byte(opts.CredProtect) << credProtectShift
 	}
 
 	nonce := mustRand(chacha20poly1305.NonceSizeX)
@@ -76,7 +88,46 @@ func (m *Mem) RegisterKey(applicationParam []byte, hmacSecret, discoverable bool
 	return keyHandle, x, y, nil
 }
 
-func (m *Mem) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, error) {
+func (m *Mem) CheckKey(keyHandle, applicationParam []byte) error {
+	_, err := m.unwrap(keyHandle, applicationParam)
+	return err
+}
+
+func (m *Mem) KeyInfo(keyHandle []byte) (tpm.KeyOptions, error) {
+	if len(keyHandle) == 0 {
+		return tpm.KeyOptions{}, fmt.Errorf("empty key handle")
+	}
+	opts := tpm.KeyOptions{
+		HMACSecret:   true,
+		Discoverable: keyHandle[0]&flagDiscoverable != 0,
+		CredProtect:  int(keyHandle[0]&credProtectBits) >> credProtectShift,
+	}
+	if opts.CredProtect == 0 {
+		opts.CredProtect = 1
+	}
+	return opts, nil
+}
+
+func (m *Mem) SignASN1(keyHandle, applicationParam, digest, uvPinHash []byte) ([]byte, error) {
+	childPrivateKey, err := m.unwrap(keyHandle, applicationParam)
+	if err != nil {
+		return nil, err
+	}
+	if opts, _ := m.KeyInfo(keyHandle); opts.CredProtect == 3 &&
+		(m.pinHash == nil || subtle.ConstantTimeCompare(m.pinHash, uvPinHash) != 1) {
+		return nil, tpm.ErrPINRequired
+	}
+
+	var ecdsaKey ecdsa.PrivateKey
+
+	ecdsaKey.D = new(big.Int).SetBytes(childPrivateKey)
+	ecdsaKey.PublicKey.Curve = elliptic.P256()
+	ecdsaKey.PublicKey.X, ecdsaKey.PublicKey.Y = ecdsaKey.PublicKey.Curve.ScalarBaseMult(ecdsaKey.D.Bytes())
+
+	return ecdsa.SignASN1(rand.Reader, &ecdsaKey, digest)
+}
+
+func (m *Mem) unwrap(keyHandle, applicationParam []byte) ([]byte, error) {
 	aead, err := chacha20poly1305.NewX(m.masterPrivateKey)
 	if err != nil {
 		panic(err)
@@ -99,14 +150,7 @@ func (m *Mem) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, erro
 	if err != nil {
 		return nil, fmt.Errorf("open child private key err: %w", err)
 	}
-
-	var ecdsaKey ecdsa.PrivateKey
-
-	ecdsaKey.D = new(big.Int).SetBytes(childPrivateKey)
-	ecdsaKey.PublicKey.Curve = elliptic.P256()
-	ecdsaKey.PublicKey.X, ecdsaKey.PublicKey.Y = ecdsaKey.PublicKey.Curve.ScalarBaseMult(ecdsaKey.D.Bytes())
-
-	return ecdsa.SignASN1(rand.Reader, &ecdsaKey, digest)
+	return childPrivateKey, nil
 }
 
 func mustRand(size int) []byte {
@@ -157,10 +201,6 @@ func (m *Mem) HMACSecret(keyHandle, rpIDHash, uvPinHash []byte) ([]byte, error) 
 	mac.Write(rpIDHash)
 	mac.Write(credHash[:])
 	return mac.Sum(nil), nil
-}
-
-func (m *Mem) IsDiscoverable(keyHandle []byte) bool {
-	return len(keyHandle) > 0 && keyHandle[0]&flagDiscoverable != 0
 }
 
 func (m *Mem) StoreKey() ([]byte, error) {

@@ -131,11 +131,11 @@ func (t *TPM) SetPIN(pinHash, oldPinHash []byte, retries int) error {
 			return err
 		}
 
-		srk, err := createSRK(tpm)
+		sec, err := t.secure(tpm)
 		if err != nil {
 			return err
 		}
-		defer flush(tpm, srk.ObjectHandle)
+		defer sec.close()
 
 		var blob []byte
 		if written && oldPinHash != nil {
@@ -143,10 +143,10 @@ func (t *TPM) SetPIN(pinHash, oldPinHash []byte, retries int) error {
 			if err != nil {
 				return err
 			}
-			if blob, err = changeUVKeyAuth(tpm, srk, old, oldPinHash, pinHash); err != nil {
+			if blob, err = changeUVKeyAuth(sec, old, oldPinHash, pinHash); err != nil {
 				return err
 			}
-		} else if blob, err = createUVKey(tpm, srk, pinHash); err != nil {
+		} else if blob, err = createUVKey(sec, pinHash); err != nil {
 			return err
 		}
 
@@ -160,11 +160,12 @@ func (t *TPM) SetPIN(pinHash, oldPinHash []byte, retries int) error {
 			}
 		}
 
+		// the PIN hash is the first parameter, encrypted
 		_, err = tpm2.NVDefineSpace{
 			AuthHandle: ownerAuth,
 			Auth:       tpm2.TPM2BAuth{Buffer: pinHash},
 			PublicInfo: tpm2.New2B(pinNVPublic(t.pinIndexHandle)),
-		}.Execute(tpm)
+		}.Execute(tpm, sec.encrypt(encryptIn))
 		if err != nil {
 			return fmt.Errorf("define PIN index 0x%08x (requires empty owner auth) err: %w", t.pinIndexHandle, err)
 		}
@@ -243,11 +244,16 @@ func (t *TPM) VerifyPIN(pinHash []byte) (bool, error) {
 		if err != nil {
 			return err
 		}
+		sec, err := t.secure(tpm)
+		if err != nil {
+			return err
+		}
+		defer sec.close()
 		_, err = tpm2.NVRead{
 			AuthHandle: tpm2.AuthHandle{
 				Handle: tpm2.TPMHandle(t.pinIndexHandle),
 				Name:   name,
-				Auth:   tpm2.PasswordAuth(pinHash),
+				Auth:   sec.auth(pinHash),
 			},
 			NVIndex: t.pinIndexHandleNamed(name),
 			Size:    1,

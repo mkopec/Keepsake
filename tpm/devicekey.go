@@ -104,8 +104,18 @@ func (t *TPM) createDeviceKey(tpm transport.TPM) error {
 	return nil
 }
 
-// deviceHMAC computes HMAC-SHA-256 of msg with the device key.
-func (t *TPM) deviceHMAC(tpm transport.TPM, msg []byte) ([]byte, error) {
+// deviceHMAC computes HMAC-SHA-256 of msg with the device key. With
+// encrypt, the result is encrypted on the bus.
+func (t *TPM) deviceHMAC(tpm transport.TPM, msg []byte, encrypt bool) ([]byte, error) {
+	var sessions []tpm2.Session
+	if encrypt {
+		sec, err := t.secure(tpm)
+		if err != nil {
+			return nil, err
+		}
+		defer sec.close()
+		sessions = append(sessions, sec.encrypt(encryptOut))
+	}
 	rsp, err := tpm2.Hmac{
 		Handle: tpm2.AuthHandle{
 			Handle: tpm2.TPMHandle(t.deviceKeyHandle),
@@ -114,7 +124,7 @@ func (t *TPM) deviceHMAC(tpm transport.TPM, msg []byte) ([]byte, error) {
 		},
 		Buffer:  tpm2.TPM2BMaxBuffer{Buffer: msg},
 		HashAlg: tpm2.TPMAlgSHA256,
-	}.Execute(tpm)
+	}.Execute(tpm, sessions...)
 	if err != nil {
 		return nil, fmt.Errorf("device key HMAC err: %w", err)
 	}
@@ -126,7 +136,7 @@ func (t *TPM) StoreKey() ([]byte, error) {
 	var key []byte
 	err := t.withTPM(func(tpm transport.TPM) error {
 		var err error
-		key, err = t.deviceHMAC(tpm, []byte("tpm-fido passkey store key"))
+		key, err = t.deviceHMAC(tpm, []byte("tpm-fido passkey store key"), true)
 		return err
 	})
 	return key, err
