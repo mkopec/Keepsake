@@ -37,15 +37,15 @@ GO_SOURCES = $(shell find . -name '*.go' -not -path './.git/*') go.mod go.sum
 build: tpm-fido tpm-fido-askpass
 
 tpm-fido: $(GO_SOURCES)
-	$(GO) build $(GOFLAGS) -o $@ .
+	$(GO) build $(GOFLAGS) -o $@ ./src
 
 tpm-fido-askpass: $(GO_SOURCES)
-	$(GO) build $(GOFLAGS) -o $@ ./cmd/tpm-fido-askpass
+	$(GO) build $(GOFLAGS) -o $@ ./src/cmd/tpm-fido-askpass
 
 test:
 	$(GO) test ./...
 
-# also runs the TPM tests against swtpm, see README
+# also runs the TPM tests against swtpm, see docs/testing.md
 check:
 	$(GO) vet ./...
 	@test -n "$(TPMFIDO_SWTPM)" || { echo "set TPMFIDO_SWTPM to an swtpm socket to run the TPM tests"; exit 1; }
@@ -58,11 +58,11 @@ install: build
 	fi
 	install -Dm755 tpm-fido $(DESTDIR)$(BINDIR)/tpm-fido
 	install -Dm755 tpm-fido-askpass $(DESTDIR)$(BINDIR)/tpm-fido-askpass
-	install -Dm755 settings/tpm-fido-settings $(DESTDIR)$(APPDIR)/tpm-fido-settings
-	install -Dm644 settings/securitykeys.py $(DESTDIR)$(APPDIR)/securitykeys.py
+	install -Dm755 src/settings/tpm-fido-settings $(DESTDIR)$(APPDIR)/tpm-fido-settings
+	install -Dm644 src/settings/securitykeys.py $(DESTDIR)$(APPDIR)/securitykeys.py
 	ln -sfn $(APPDIR)/tpm-fido-settings $(DESTDIR)$(BINDIR)/tpm-fido-settings
 	install -d $(DESTDIR)$(DATADIR)/applications $(DESTDIR)$(SYSTEMD_USER_DIR)
-	sed 's|^Exec=.*|Exec=$(BINDIR)/tpm-fido-settings|' settings/$(DESKTOP_FILE) \
+	sed 's|^Exec=.*|Exec=$(BINDIR)/tpm-fido-settings|' src/settings/$(DESKTOP_FILE) \
 		> $(DESTDIR)$(DATADIR)/applications/$(DESKTOP_FILE)
 	sed 's|^ExecStart=.*|ExecStart=$(BINDIR)/tpm-fido|' contrib/systemd/tpm-fido.service \
 		> $(DESTDIR)$(SYSTEMD_USER_DIR)/tpm-fido.service

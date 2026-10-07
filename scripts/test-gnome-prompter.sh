@@ -5,5 +5,7 @@
 set -e
 cd "$(dirname "$0")/.."
 export TPMFIDO_PROMPTER_TEST=1
+unset WAYLAND_DISPLAY
+export GDK_BACKEND=x11
 exec xvfb-run -a -s "-screen 0 1024x768x24" \
-	dbus-run-session -- go test -count=1 -v -run TestSystemPrompter ./gnome "$@"
+	dbus-run-session -- go test -count=1 -v -run TestSystemPrompter ./src/gnome "$@"
