@@ -4,11 +4,8 @@ package gnome
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"math/big"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,17 +53,22 @@ type callback struct {
 	// connections are refused, so other programs can't answer the
 	// prompt.
 	owner string
-	ready chan string
+	ready chan reply
 	done  chan struct{}
 	once  sync.Once
 }
 
-func (c *callback) PromptReady(sender dbus.Sender, reply string, properties map[string]dbus.Variant, exchange string) *dbus.Error {
+type reply struct {
+	reply    string
+	exchange string
+}
+
+func (c *callback) PromptReady(sender dbus.Sender, r string, properties map[string]dbus.Variant, exchange string) *dbus.Error {
 	if string(sender) != c.owner {
 		return dbus.MakeFailedError(errors.New("not the system prompter"))
 	}
 	select {
-	case c.ready <- reply:
+	case c.ready <- reply{r, exchange}:
 	default:
 	}
 	return nil
@@ -80,21 +82,77 @@ func (c *callback) PromptDone(sender dbus.Sender) *dbus.Error {
 	return nil
 }
 
+// Confirm shows a confirmation prompt. It implements ui.Confirmer.
 func (p *Prompter) Confirm(ctx context.Context, prompt ui.Prompt) (bool, error) {
+	ex, err := newSecretExchange()
+	if err != nil {
+		return false, err
+	}
+	r, err := p.perform(ctx, "confirm", props(prompt), ex.begin())
+	if err != nil {
+		return false, err
+	}
+	return r.reply == "yes", nil
+}
+
+// PasswordPrompt is a password prompt.
+type PasswordPrompt struct {
+	ui.Prompt
+	// Warning is shown in the prompt, e.g. after a wrong password.
+	Warning string
+}
+
+// ErrCancelled is returned by Password when the user cancels the prompt.
+var ErrCancelled = errors.New("prompt cancelled")
+
+// Password asks for a password. The password travels from the prompter
+// encrypted with the gcr secret exchange.
+func (p *Prompter) Password(ctx context.Context, prompt PasswordPrompt) (string, error) {
+	ex, err := newSecretExchange()
+	if err != nil {
+		return "", err
+	}
+	pr := props(prompt.Prompt)
+	pr["warning"] = dbus.MakeVariant(prompt.Warning)
+	pr["password-new"] = dbus.MakeVariant(false)
+	r, err := p.perform(ctx, "password", pr, ex.begin())
+	if err != nil {
+		return "", err
+	}
+	if r.reply != "yes" {
+		return "", ErrCancelled
+	}
+	return ex.receive(r.exchange)
+}
+
+func props(prompt ui.Prompt) map[string]dbus.Variant {
+	return map[string]dbus.Variant{
+		"title":          dbus.MakeVariant(prompt.Heading),
+		"message":        dbus.MakeVariant(prompt.Heading),
+		"description":    dbus.MakeVariant(prompt.Body),
+		"warning":        dbus.MakeVariant(""),
+		"choice-label":   dbus.MakeVariant(""),
+		"continue-label": dbus.MakeVariant(okLabel(prompt)),
+		"cancel-label":   dbus.MakeVariant("Cancel"),
+	}
+}
+
+// perform shows one prompt and returns the prompter's reply.
+func (p *Prompter) perform(ctx context.Context, typ string, props map[string]dbus.Variant, exchange string) (reply, error) {
 	var owner string
 	err := p.conn.BusObject().CallWithContext(ctx, "org.freedesktop.DBus.GetNameOwner", 0, prompterBusName).Store(&owner)
 	if err != nil {
-		return false, fmt.Errorf("system prompter not available: %w", err)
+		return reply{}, fmt.Errorf("system prompter not available: %w", err)
 	}
 
 	path := dbus.ObjectPath(fmt.Sprintf("%s/%d", callbackPathPrefix, p.seq.Add(1)))
 	cb := &callback{
 		owner: owner,
-		ready: make(chan string, 1),
+		ready: make(chan reply, 1),
 		done:  make(chan struct{}),
 	}
 	if err := p.conn.Export(cb, path, callbackInterface); err != nil {
-		return false, err
+		return reply{}, err
 	}
 	defer p.conn.Export(nil, path, callbackInterface)
 
@@ -102,7 +160,7 @@ func (p *Prompter) Confirm(ctx context.Context, prompt ui.Prompt) (bool, error) 
 	// meantime can't receive them half way through.
 	prompter := p.conn.Object(owner, prompterPath)
 	if err := prompter.CallWithContext(ctx, prompterInterface+".BeginPrompting", 0, path).Err; err != nil {
-		return false, fmt.Errorf("begin prompting err: %w", err)
+		return reply{}, fmt.Errorf("begin prompting err: %w", err)
 	}
 	defer func() {
 		// StopPrompting closes the dialog if it is still shown. Use a
@@ -119,44 +177,26 @@ func (p *Prompter) Confirm(ctx context.Context, prompt ui.Prompt) (bool, error) 
 	// wait for the prompter to be ready; other clients' prompts may be
 	// shown first
 	if _, err := cb.wait(ctx); err != nil {
-		return false, err
+		return reply{}, err
 	}
 
-	exchange, err := beginSecretExchange()
+	err = prompter.CallWithContext(ctx, prompterInterface+".PerformPrompt", 0, path, typ, props, exchange).Err
 	if err != nil {
-		return false, err
+		return reply{}, fmt.Errorf("perform prompt err: %w", err)
 	}
-	props := map[string]dbus.Variant{
-		"title":          dbus.MakeVariant(prompt.Heading),
-		"message":        dbus.MakeVariant(prompt.Heading),
-		"description":    dbus.MakeVariant(prompt.Body),
-		"warning":        dbus.MakeVariant(""),
-		"choice-label":   dbus.MakeVariant(""),
-		"continue-label": dbus.MakeVariant(okLabel(prompt)),
-		"cancel-label":   dbus.MakeVariant("Cancel"),
-	}
-	err = prompter.CallWithContext(ctx, prompterInterface+".PerformPrompt", 0, path, "confirm", props, exchange).Err
-	if err != nil {
-		return false, fmt.Errorf("perform prompt err: %w", err)
-	}
-
-	reply, err := cb.wait(ctx)
-	if err != nil {
-		return false, err
-	}
-	return reply == "yes", nil
+	return cb.wait(ctx)
 }
 
 // wait returns the next reply from the prompter. A prompter that stops
 // prompting without replying counts as a cancelled prompt.
-func (c *callback) wait(ctx context.Context) (string, error) {
+func (c *callback) wait(ctx context.Context) (reply, error) {
 	select {
-	case reply := <-c.ready:
-		return reply, nil
+	case r := <-c.ready:
+		return r, nil
 	case <-c.done:
-		return "no", nil
+		return reply{reply: "no"}, nil
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return reply{}, ctx.Err()
 	}
 }
 
@@ -165,32 +205,4 @@ func okLabel(p ui.Prompt) string {
 		return "OK"
 	}
 	return p.OK
-}
-
-// The prompter refuses a prompt without a valid gcr secret exchange
-// ("sx-aes-1"), even a confirmation that doesn't transfer a secret. The
-// exchange begins with a Diffie-Hellman public key in the 1536 bit MODP
-// group (RFC 3526 group 5). No secret is ever sent, so the private key is
-// thrown away.
-var (
-	modp1536, _ = new(big.Int).SetString(
-		"FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"+
-			"29024E088A67CC74020BBEA63B139B22514A08798E3404DD"+
-			"EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"+
-			"E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"+
-			"EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"+
-			"C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"+
-			"83655D23DCA3AD961C62F356208552BB9ED529077096966D"+
-			"670C354E4ABC9804F1746C08CA237327FFFFFFFFFFFFFFFF", 16)
-	modpGenerator = big.NewInt(2)
-)
-
-func beginSecretExchange() (string, error) {
-	priv, err := rand.Int(rand.Reader, new(big.Int).Sub(modp1536, big.NewInt(2)))
-	if err != nil {
-		return "", err
-	}
-	priv.Add(priv, big.NewInt(1))
-	pub := new(big.Int).Exp(modpGenerator, priv, modp1536)
-	return "[sx-aes-1]\npublic=" + base64.StdEncoding.EncodeToString(pub.Bytes()) + "\n", nil
 }

@@ -130,6 +130,19 @@ tpm-fido asks logind (`LockedHint` and `Active` of the user's session) and GNOME
 
 Stopping the service (`systemctl --user stop tpm-fido`) removes the virtual security key, for example to use only a hardware key for a while. The credentials stay in the TPM.
 
+### SSH keys and GNOME's SSH agent
+
+`ssh-keygen -t ecdsa-sk` works with tpm-fido; with `-O verify-required` every signature also needs the PIN. ssh asks for the PIN in the terminal, but an SSH agent has no terminal and asks through `SSH_ASKPASS`; without one it refuses to sign ("agent refused operation"). GNOME's agent (`gcr-ssh-agent`, `SSH_AUTH_SOCK=/run/user/$UID/gcr/ssh`) has none configured.
+
+`tpm-fido-askpass` asks with the GNOME system prompt, the same dialog as tpm-fido's confirmations. The PIN travels from the prompt encrypted with gcr's secret exchange. To use it with GNOME's agent:
+
+```
+make install
+make enable-gnome-ssh   # adds a drop-in to gcr-ssh-agent.service and restarts it
+```
+
+Then sign in as usual: GNOME asks for the security key PIN, then tpm-fido for confirmation. `make disable-gnome-ssh` removes the drop-in. It also works with OpenSSH's own agent: set `SSH_ASKPASS` to `tpm-fido-askpass` and `SSH_ASKPASS_REQUIRE=force` in its environment.
+
 ### Security Keys app
 
 `settings/tpm-fido-settings` is a GTK 4 / libadwaita app to set and change the PIN, list and delete passkeys, and reset the security key. It uses standard CTAP2 commands (python-fido2), so it also manages hardware security keys. It needs PyGObject, libadwaita and python-fido2 (on Arch: `python-gobject libadwaita python-fido2`). `make install` installs it; it shows up as "Security Keys". Listing and deleting passkeys requires the PIN.

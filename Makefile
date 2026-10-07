@@ -3,6 +3,7 @@
 #   make                     build tpm-fido
 #   make install             install for the current user (no root needed)
 #   make enable              start tpm-fido now and with every graphical login
+#   make enable-gnome-ssh    let GNOME's SSH agent ask for security key PINs
 #   sudo make install-system udev rule, uhid module, add $SUDO_USER to tss
 #
 # The user install goes to ~/.local and ~/.config by default. Packagers can
@@ -22,17 +23,24 @@ GOFLAGS ?= -trimpath
 
 DESKTOP_FILE = io.github.psanford.TpmFido.Settings.desktop
 
-.PHONY: all build test check install uninstall enable disable install-system uninstall-system check-deps help
+.PHONY: all build test check install uninstall enable disable enable-gnome-ssh disable-gnome-ssh install-system uninstall-system check-deps help
+
+GCR_SSH_DROPIN = $(HOME)/.config/systemd/user/gcr-ssh-agent.service.d/tpm-fido-askpass.conf
 
 all: build
 
 help:
-	@sed -n '3,9p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '3,10p' Makefile | sed 's/^# \{0,1\}//'
 
-build: tpm-fido
+GO_SOURCES = $(shell find . -name '*.go' -not -path './.git/*') go.mod go.sum
 
-tpm-fido: $(shell find . -name '*.go' -not -path './.git/*') go.mod go.sum
+build: tpm-fido tpm-fido-askpass
+
+tpm-fido: $(GO_SOURCES)
 	$(GO) build $(GOFLAGS) -o $@ .
+
+tpm-fido-askpass: $(GO_SOURCES)
+	$(GO) build $(GOFLAGS) -o $@ ./cmd/tpm-fido-askpass
 
 test:
 	$(GO) test ./...
@@ -49,6 +57,7 @@ install: build
 		exit 1; \
 	fi
 	install -Dm755 tpm-fido $(DESTDIR)$(BINDIR)/tpm-fido
+	install -Dm755 tpm-fido-askpass $(DESTDIR)$(BINDIR)/tpm-fido-askpass
 	install -Dm755 settings/tpm-fido-settings $(DESTDIR)$(APPDIR)/tpm-fido-settings
 	install -Dm644 settings/securitykeys.py $(DESTDIR)$(APPDIR)/securitykeys.py
 	ln -sfn $(APPDIR)/tpm-fido-settings $(DESTDIR)$(BINDIR)/tpm-fido-settings
@@ -67,8 +76,8 @@ install: build
 		$(MAKE) --no-print-directory check-deps; \
 	fi
 
-uninstall: disable
-	rm -f $(DESTDIR)$(BINDIR)/tpm-fido $(DESTDIR)$(BINDIR)/tpm-fido-settings
+uninstall: disable disable-gnome-ssh
+	rm -f $(DESTDIR)$(BINDIR)/tpm-fido $(DESTDIR)$(BINDIR)/tpm-fido-askpass $(DESTDIR)$(BINDIR)/tpm-fido-settings
 	rm -f $(DESTDIR)$(APPDIR)/tpm-fido-settings $(DESTDIR)$(APPDIR)/securitykeys.py
 	rm -rf $(DESTDIR)$(APPDIR)/__pycache__
 	-rmdir $(DESTDIR)$(APPDIR) 2>/dev/null
@@ -84,6 +93,28 @@ enable:
 disable:
 	@if [ -z "$(DESTDIR)" ] && systemctl --user cat tpm-fido.service >/dev/null 2>&1; then \
 		systemctl --user disable --now tpm-fido.service; \
+	fi
+
+# GNOME's SSH agent (gcr-ssh-agent) runs an ssh-agent that asks for the PIN
+# of verify-required security keys (ssh-keygen -O verify-required) through
+# SSH_ASKPASS. Without one it refuses to sign ("agent refused operation").
+# Restarting it forgets keys added with ssh-add; keys in ~/.ssh are loaded
+# again automatically.
+enable-gnome-ssh:
+	@test -x $(BINDIR)/tpm-fido-askpass || { echo "run 'make install' first"; exit 1; }
+	install -d $(dir $(GCR_SSH_DROPIN))
+	printf '[Service]\nEnvironment=SSH_ASKPASS=%s\nEnvironment=SSH_ASKPASS_REQUIRE=force\n' \
+		'$(BINDIR)/tpm-fido-askpass' > $(GCR_SSH_DROPIN)
+	systemctl --user daemon-reload
+	systemctl --user try-restart gcr-ssh-agent.service
+	@echo "gcr-ssh-agent now asks for security key PINs with tpm-fido-askpass."
+
+disable-gnome-ssh:
+	@if [ -z "$(DESTDIR)" ] && [ -f $(GCR_SSH_DROPIN) ]; then \
+		rm -f $(GCR_SSH_DROPIN); \
+		rmdir $(dir $(GCR_SSH_DROPIN)) 2>/dev/null; \
+		systemctl --user daemon-reload; \
+		systemctl --user try-restart gcr-ssh-agent.service; \
 	fi
 
 # Run with sudo. Adds the user who ran sudo to the tss group, unless

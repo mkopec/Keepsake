@@ -1,8 +1,14 @@
 package gnome
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"io"
 	"math/big"
 	"os"
 	"os/exec"
@@ -12,13 +18,15 @@ import (
 
 	"github.com/godbus/dbus/v5"
 	"github.com/psanford/tpm-fido/ui"
+	"golang.org/x/crypto/hkdf"
 )
 
 func TestSecretExchangeFormat(t *testing.T) {
-	ex, err := beginSecretExchange()
+	e, err := newSecretExchange()
 	if err != nil {
 		t.Fatal(err)
 	}
+	ex := e.begin()
 	const prefix = "[sx-aes-1]\npublic="
 	if !strings.HasPrefix(ex, prefix) || !strings.HasSuffix(ex, "\n") {
 		t.Fatalf("unexpected exchange %q", ex)
@@ -30,6 +38,35 @@ func TestSecretExchangeFormat(t *testing.T) {
 	y := new(big.Int).SetBytes(pub)
 	if len(pub) > 192 || y.Cmp(big.NewInt(1)) <= 0 || y.Cmp(modp1536) >= 0 {
 		t.Fatalf("public value out of range (%d bytes)", len(pub))
+	}
+}
+
+// The prompter's side of the exchange, as gcr implements it.
+func TestSecretExchangeRoundTrip(t *testing.T) {
+	client, _ := newSecretExchange()
+	server, _ := newSecretExchange()
+	z := new(big.Int).Exp(client.pub, server.priv, modp1536).FillBytes(make([]byte, 192))
+	key := make([]byte, 16)
+	io.ReadFull(hkdf.New(sha256.New, z, nil, nil), key)
+	for _, secret := range []string{"", "1234", "exactly16bytes!!", "pässwörd with spaces"} {
+		padded := []byte(secret)
+		n := 16 - len(padded)%16
+		padded = append(padded, bytes.Repeat([]byte{byte(n)}, n)...)
+		iv := make([]byte, 16)
+		rand.Read(iv)
+		block, _ := aes.NewCipher(key)
+		ct := make([]byte, len(padded))
+		cipher.NewCBCEncrypter(block, iv).CryptBlocks(ct, padded)
+		msg := "[sx-aes-1]\npublic=" + base64.StdEncoding.EncodeToString(server.pub.Bytes()) +
+			"\niv=" + base64.StdEncoding.EncodeToString(iv) +
+			"\nsecret=" + base64.StdEncoding.EncodeToString(ct) + "\n"
+		got, err := client.receive(msg)
+		if err != nil || got != secret {
+			t.Fatalf("%q: got %q %v", secret, got, err)
+		}
+	}
+	if _, err := client.receive("[sx-aes-1]\npublic=AQ==\niv=AAAAAAAAAAAAAAAAAAAAAA==\nsecret=AAAAAAAAAAAAAAAAAAAAAA==\n"); err == nil {
+		t.Fatal("accepted public value 1")
 	}
 }
 
@@ -112,6 +149,35 @@ func TestSystemPrompter(t *testing.T) {
 	}
 	if ok || err != context.DeadlineExceeded {
 		t.Fatalf("forged reply changed the result: %v %v", ok, err)
+	}
+
+	// password prompt: the typed text comes back through the exchange
+	pw := PasswordPrompt{Prompt: ui.Prompt{Heading: "Enter Security Key PIN", Body: "test", OK: "Continue"}}
+	go func() {
+		out, err := exec.Command("xdotool", "search", "--sync", "--name", pw.Heading).Output()
+		if err != nil {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+		win := string(out[:len(out)-1])
+		exec.Command("xdotool", "windowfocus", "--sync", win).Run()
+		exec.Command("xdotool", "type", "--delay", "30", "pä55 wörd").Run()
+		exec.Command("xdotool", "key", "Return").Run()
+	}()
+	if got, err := p.Password(ctx, pw); err != nil || got != "pä55 wörd" {
+		t.Fatalf("password: %q %v", got, err)
+	}
+	go func() {
+		out, err := exec.Command("xdotool", "search", "--sync", "--name", pw.Heading).Output()
+		if err != nil {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+		exec.Command("xdotool", "windowfocus", "--sync", string(out[:len(out)-1])).Run()
+		exec.Command("xdotool", "key", "Escape").Run()
+	}()
+	if _, err := p.Password(ctx, pw); err != ErrCancelled {
+		t.Fatalf("cancelled password: %v", err)
 	}
 
 	// the cancelled prompt must have been closed
