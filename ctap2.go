@@ -13,7 +13,7 @@ import (
 	"github.com/psanford/tpm-fido/ctap2"
 	"github.com/psanford/tpm-fido/fidohid"
 	"github.com/psanford/tpm-fido/passkeys"
-	"github.com/psanford/tpm-fido/pinentry"
+	"github.com/psanford/tpm-fido/ui"
 )
 
 // aaguid identifies the tpm-fido authenticator model:
@@ -59,6 +59,14 @@ func (s *server) dispatchCBOR(evt fidohid.AuthEvent, ka *keepalive) (interface{}
 	// credential management enumerations must not be interrupted either
 	if cmd != ctap2.CmdCredentialMgmt && cmd != ctap2.CmdCredentialMgmtPreview {
 		s.credMgmt = nil
+	}
+
+	// Refuse everything but GetInfo while the session is locked: nobody
+	// can confirm a request, and requests without user presence (silent
+	// probing, hmac-secret with up=false) shouldn't succeed while the user
+	// is away either.
+	if cmd != ctap2.CmdGetInfo && s.sessionLocked(evt.Ctx) {
+		return nil, ctap2.ErrOperationDenied
 	}
 
 	switch cmd {
@@ -424,21 +432,42 @@ func (s *server) ownsCredential(credID, rpIDHash []byte) bool {
 
 // confirmPresence asks the user to confirm the request. It returns nil if the
 // user confirmed and the CTAP2 status to return otherwise.
-func (s *server) confirmPresence(evt fidohid.AuthEvent, ka *keepalive, prompt pinentry.Prompt) error {
+func (s *server) confirmPresence(evt fidohid.AuthEvent, ka *keepalive, prompt ui.Prompt) error {
 	ka.set(fidohid.KeepaliveUPNeeded)
 	defer ka.set(fidohid.KeepaliveProcessing)
 
 	ctx, cancel := context.WithTimeout(evt.Ctx, userPresenceTimeout)
 	defer cancel()
 
+	// close the dialog if the session gets locked while it is shown
+	var locked atomic.Bool
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if s.sessionLocked(ctx) {
+					locked.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
 	ok, err := s.pe.Confirm(ctx, prompt)
 	switch {
 	case evt.Ctx.Err() != nil:
 		return ctap2.ErrKeepaliveCancel
+	case locked.Load():
+		return ctap2.ErrOperationDenied
 	case ctx.Err() != nil:
 		return ctap2.ErrUserActionTimeout
 	case err != nil:
-		log.Printf("pinentry err: %s", err)
+		log.Printf("confirmation dialog err: %s", err)
 		return ctap2.ErrOperationDenied
 	case !ok:
 		return ctap2.ErrOperationDenied

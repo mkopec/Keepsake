@@ -8,7 +8,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"flag"
+	"io/fs"
 	"log"
 	"math/big"
 	"os"
@@ -21,10 +23,10 @@ import (
 	"github.com/psanford/tpm-fido/fidohid"
 	"github.com/psanford/tpm-fido/memory"
 	"github.com/psanford/tpm-fido/passkeys"
-	"github.com/psanford/tpm-fido/pinentry"
 	"github.com/psanford/tpm-fido/sitesignatures"
 	"github.com/psanford/tpm-fido/statuscode"
 	"github.com/psanford/tpm-fido/tpm"
+	"github.com/psanford/tpm-fido/ui"
 )
 
 var backend = flag.String("backend", "tpm", "tpm|memory")
@@ -37,12 +39,17 @@ var passkeyStore = flag.String("passkey-store", "", "passkey store path (default
 
 func main() {
 	flag.Parse()
+	if os.Getenv("JOURNAL_STREAM") != "" {
+		// journald adds its own timestamps
+		log.SetFlags(0)
+	}
 	s := newServer()
 	s.run()
 }
 
 type server struct {
-	pe     *pinentry.Pinentry
+	pe     *ui.Prompter
+	locker Locker
 	signer Signer
 	pins   PINStore
 	pin    *pinState
@@ -70,7 +77,6 @@ type Signer interface {
 
 func newServer() *server {
 	s := server{
-		pe:  pinentry.New(),
 		pin: newPINState(),
 	}
 	if *backend == "tpm" {
@@ -80,15 +86,18 @@ func newServer() *server {
 			StateIndex:   uint32(*stateIndex),
 			DeviceKey:    uint32(*deviceKeyHandle),
 		})
+		if errors.Is(err, fs.ErrPermission) {
+			log.Fatalf("%s: add your user to the group owning %s (usually tss) and log in again", err, *device)
+		}
 		if err != nil {
-			panic(err)
+			log.Fatalf("TPM: %s", err)
 		}
 		s.signer = signer
 		s.pins = signer
 	} else if *backend == "memory" {
 		signer, err := memory.New()
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
 		s.signer = signer
 		s.pins = signer
@@ -99,28 +108,31 @@ func newServer() *server {
 		// the memory backend's keys don't outlive the process
 		dir, err := os.MkdirTemp("", "tpm-fido-memory-")
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
 		path = filepath.Join(dir, "passkeys")
 	} else if path == "" {
 		var err error
 		if path, err = passkeys.DefaultPath(); err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
 	}
 	s.passkeys = s.newPasskeyStore(path)
+
+	if err := s.setupDesktop(); err != nil {
+		log.Fatal(err)
+	}
 	return &s
 }
 
 func (s *server) run() {
 	ctx := context.Background()
 
-	if pinentry.FindPinentryGUIPath() == "" {
-		log.Printf("warning: no gui pinentry binary detected in PATH. tpm-fido may not work correctly without a gui based pinentry")
-	}
-
 	token, err := fidohid.New(ctx, "tpm-fido")
 	if err != nil {
+		if errors.Is(err, fs.ErrPermission) {
+			log.Fatalf("create fido hid error: %s: your user needs read and write access to /dev/uhid, see the README", err)
+		}
 		log.Fatalf("create fido hid error: %s", err)
 	}
 
@@ -147,6 +159,15 @@ func (s *server) handleEvent(ctx context.Context, token *fidohid.SoftToken, evt 
 	}
 
 	req := evt.Req
+
+	// While the session is locked, answer like a key waiting for a touch;
+	// the host keeps retrying. Check-only requests don't sign anything.
+	needsUser := req.Command == fidoauth.CmdRegister ||
+		(req.Command == fidoauth.CmdAuthenticate && req.Authenticate.Ctrl != fidoauth.CtrlCheckOnly)
+	if needsUser && s.sessionLocked(ctx) {
+		token.WriteResponse(ctx, evt, nil, statuscode.ConditionsNotSatisfied)
+		return
+	}
 
 	if req.Command == fidoauth.CmdAuthenticate {
 		log.Printf("got AuthenticateCmd site=%s", sitesignatures.FromAppParam(req.Authenticate.ApplicationParam))

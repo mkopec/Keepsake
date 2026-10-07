@@ -1,0 +1,21 @@
+[Unit]
+Description=TPM backed FIDO2 security key
+Documentation=https://github.com/psanford/tpm-fido
+# Run only while a graphical session is up: nobody can confirm requests
+# without one.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/tpm-fido
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=graphical-session.target

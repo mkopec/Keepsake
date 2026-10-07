@@ -113,11 +113,14 @@ func (s *server) credentialManagement(req *ctap2.CredMgmtReq) (interface{}, erro
 		if params.CredentialID == nil {
 			return nil, ctap2.ErrMissingParameter
 		}
+		// kept reuses creds' backing array, so copy the deleted entry
+		// instead of pointing into creds
 		kept := creds[:0]
 		var deleted *passkeys.Credential
-		for i, c := range creds {
+		for _, c := range creds {
 			if bytes.Equal(c.ID, params.CredentialID.ID) {
-				deleted = &creds[i]
+				d := c
+				deleted = &d
 				continue
 			}
 			kept = append(kept, c)

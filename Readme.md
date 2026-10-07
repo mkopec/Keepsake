@@ -28,7 +28,7 @@ tpm-fido speaks both U2F (CTAP1) and CTAP 2.0. The CTAP2 `rpIdHash` is the same 
 
 Supported: `authenticatorMakeCredential` (ES256 only, "packed" self attestation), `authenticatorGetAssertion` and `authenticatorGetNextAssertion` (including discoverable credentials, i.e. passkeys), `authenticatorGetInfo`, `authenticatorClientPIN` (PIN protocols 1 and 2), `authenticatorReset`, the credential management preview command of `FIDO_2_1_PRE` authenticators, and the `hmac-secret` extension.
 
-User presence is confirmed through `pinentry`, with the relying party ID and user name shown in the prompt.
+User presence is confirmed in a dialog showing the relying party ID and user name (see [Desktop integration](#desktop-integration)).
 
 ### Passkeys
 
@@ -95,6 +95,46 @@ swtpm socket --tpm2 --tpmstate dir=/tmp/swtpm --server type=unixio,path=/tmp/swt
 ./tpm-fido -device /tmp/swtpm/sock
 ```
 
+## Desktop integration
+
+### Confirmation dialogs
+
+On GNOME, tpm-fido shows its dialogs with the GNOME Shell system prompter, the same system-modal dialog GNOME Keyring uses, over gcr's D-Bus interface (`org.gnome.keyring.SystemPrompter`). Elsewhere it falls back to `pinentry`. Choose explicitly with `-prompt gnome` (which also starts gcr's `gcr-prompter` on other desktops) or `-prompt pinentry`.
+
+tpm-fido only accepts answers from the connection that owns the prompter's bus name, so other programs on the session bus can't confirm a prompt.
+
+### Screen lock
+
+While the session is locked or inactive (another user's session is in the foreground), tpm-fido refuses every request except `authenticatorGetInfo`: nobody can confirm them, and requests that don't need confirmation (`up=false` sign-ins, which can also return hmac-secret secrets) shouldn't succeed while you are away. A dialog that is open when the screen locks is closed and its request refused. U2F requests are answered like a key waiting for a touch, so the browser keeps waiting.
+
+tpm-fido asks logind (`LockedHint` and `Active` of the user's session) and GNOME Shell's screen shield (`org.gnome.ScreenSaver`). If neither can be asked, requests are allowed. Disable the check with `-lock-check=false`.
+
+### systemd user service
+
+`contrib/systemd/tpm-fido.service` starts tpm-fido with the graphical session, restarts it if it fails, and stops it at logout:
+
+```
+go build -o ~/.local/bin/tpm-fido
+cp contrib/systemd/tpm-fido.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now tpm-fido.service
+journalctl --user -u tpm-fido -f
+```
+
+Stopping the service (`systemctl --user stop tpm-fido`) removes the virtual security key, for example to use only a hardware key for a while. The credentials stay in the TPM.
+
+### Security Keys app
+
+`settings/tpm-fido-settings` is a GTK 4 / libadwaita app to set and change the PIN, list and delete passkeys, and reset the security key. It uses standard CTAP2 commands (python-fido2), so it also manages hardware security keys. It needs PyGObject, libadwaita and python-fido2 (on Arch: `python-gobject libadwaita python-fido2`).
+
+```
+mkdir -p ~/.local/bin ~/.local/share/applications
+ln -s "$PWD/settings/tpm-fido-settings" ~/.local/bin/tpm-fido-settings
+cp settings/io.github.psanford.TpmFido.Settings.desktop ~/.local/share/applications/
+```
+
+The app shows up as "Security Keys". Listing and deleting passkeys requires the PIN.
+
 ## Building
 
 ```
@@ -106,14 +146,15 @@ go build
 
 In order to run `tpm-fido` you will need permission to access `/dev/tpmrm0`. On Ubuntu and Arch, you can add your user to the `tss` group.
 
-Your user also needs permission to access `/dev/uhid` so that `tpm-fido` can appear to be a USB device.
-I use the following udev rule to set the appropriate `uhid` permissions:
+Your user also needs permission to access `/dev/uhid` so that `tpm-fido` can appear to be a USB device. This udev rule gives the user logged in at the local desktop access, and loading the `uhid` module at boot makes sure the rule applies:
 
 ```
-KERNEL=="uhid", SUBSYSTEM=="misc", GROUP="SOME_UHID_GROUP_MY_USER_BELONGS_TO", MODE="0660"
+echo 'KERNEL=="uhid", SUBSYSTEM=="misc", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/70-uhid.rules
+echo uhid | sudo tee /etc/modules-load.d/uhid.conf
+sudo udevadm control --reload && sudo udevadm trigger --name-match=uhid
 ```
 
-To ensure the above udev rule gets triggered, I also add the `uhid` module to `/etc/modules-load.d/uhid.conf` so that it loads at boot.
+The rule file must sort before `73-seat-late.rules`. Without a local session (e.g. over SSH), use `GROUP="<a group you are in>", MODE="0660"` instead of `TAG+="uaccess"`. Access to `/dev/uhid` allows creating any HID device, including keyboards, so keep it limited.
 
 tpm-fido creates the following TPM objects, which requires the owner hierarchy to have an empty authorization value:
 
@@ -134,4 +175,4 @@ Note: do not run with `sudo` or as root, as it will not work.
 
 ## Dependencies
 
-tpm-fido requires `pinentry` to be available on the system. If you have gpg installed you most likely already have `pinentry`.
+Outside GNOME, tpm-fido requires `pinentry` to be available on the system. If you have gpg installed you most likely already have `pinentry`.

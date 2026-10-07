@@ -11,6 +11,7 @@ require (
 )
 
 require (
+	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
-	golang.org/x/sys v0.8.0 // indirect
+	golang.org/x/sys v0.27.0 // indirect
 )

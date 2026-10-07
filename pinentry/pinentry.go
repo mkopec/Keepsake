@@ -2,48 +2,27 @@ package pinentry
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os/exec"
-	"sync"
-	"time"
 
 	assuan "github.com/foxcpp/go-assuan/client"
 	"github.com/foxcpp/go-assuan/pinentry"
+	"github.com/psanford/tpm-fido/ui"
 )
 
 func New() *Pinentry {
 	return &Pinentry{}
 }
 
-type Pinentry struct {
-	mu            sync.Mutex
-	activeRequest *request
-}
+// Pinentry shows confirmation dialogs with a pinentry program. It
+// implements ui.Confirmer.
+type Pinentry struct{}
 
-type request struct {
-	timeout       time.Duration
-	pendingResult chan Result
-	extendTimeout chan time.Duration
-
-	challengeParam   [32]byte
-	applicationParam [32]byte
-}
-
-// Prompt is the content of a confirmation dialog. pinentry-gnome3 shows it
-// as a GNOME Shell system prompt: Heading as the bold heading, Body below
-// it, and a Cancel and an OK button. Other pinentries don't show the
-// heading of a confirmation, so it is also used as the window title.
-type Prompt struct {
-	Heading string
-	Body    string
-	// OK labels the confirming button. GNOME's HIG asks for a verb
-	// describing the action ("Sign In"), not "OK".
-	OK string
-}
-
-func (p Prompt) apply(c *pinentry.Client) {
+// The heading is set as the prompt, which pinentry-gnome3 shows as the
+// heading of the GNOME Shell system prompt. Other pinentries don't show
+// the prompt of a confirmation, so it is also used as the window title.
+func apply(c *pinentry.Client, p ui.Prompt) {
 	c.SetTitle(p.Heading)
 	c.SetPrompt(p.Heading)
 	c.SetDesc(p.Body)
@@ -53,66 +32,9 @@ func (p Prompt) apply(c *pinentry.Client) {
 	c.SetCancelBtn("Cancel")
 }
 
-type Result struct {
-	OK    bool
-	Error error
-}
-
-func (pe *Pinentry) ConfirmPresence(prompt Prompt, challengeParam, applicationParam [32]byte) (chan Result, error) {
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-
-	timeout := 2 * time.Second
-
-	if pe.activeRequest != nil {
-		if challengeParam != pe.activeRequest.challengeParam || applicationParam != pe.activeRequest.applicationParam {
-			return nil, errors.New("other request already in progress")
-		}
-
-		extendTimeoutChan := pe.activeRequest.extendTimeout
-
-		go func() {
-			select {
-			case extendTimeoutChan <- timeout:
-			case <-time.After(timeout):
-			}
-		}()
-
-		return pe.activeRequest.pendingResult, nil
-	}
-
-	pe.activeRequest = &request{
-		timeout:          timeout,
-		challengeParam:   challengeParam,
-		applicationParam: applicationParam,
-		pendingResult:    make(chan Result),
-		extendTimeout:    make(chan time.Duration),
-	}
-
-	go pe.prompt(pe.activeRequest, prompt)
-
-	return pe.activeRequest.pendingResult, nil
-}
-
-// Confirm shows a confirmation dialog and blocks
-// until the user answers or ctx is done. It returns true if the user
-// confirmed. Unlike ConfirmPresence it is meant for CTAP2 requests, where the
-// host waits for a single request instead of polling.
-func (pe *Pinentry) Confirm(ctx context.Context, prompt Prompt) (bool, error) {
-	pe.mu.Lock()
-	if pe.activeRequest != nil {
-		pe.mu.Unlock()
-		return false, errors.New("other request already in progress")
-	}
-	pe.activeRequest = &request{}
-	pe.mu.Unlock()
-
-	defer func() {
-		pe.mu.Lock()
-		pe.activeRequest = nil
-		pe.mu.Unlock()
-	}()
-
+// Confirm shows a confirmation dialog and blocks until the user answers or
+// ctx is done.
+func (pe *Pinentry) Confirm(ctx context.Context, prompt ui.Prompt) (bool, error) {
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	p, cmd, err := launchPinEntry(childCtx)
@@ -125,7 +47,7 @@ func (pe *Pinentry) Confirm(ctx context.Context, prompt Prompt) (bool, error) {
 	}()
 
 	defer p.Shutdown()
-	prompt.apply(p)
+	apply(p, prompt)
 
 	promptResult := make(chan error, 1)
 	go func() {
@@ -134,76 +56,9 @@ func (pe *Pinentry) Confirm(ctx context.Context, prompt Prompt) (bool, error) {
 
 	select {
 	case err := <-promptResult:
-		if ctx.Err() != nil {
-			return false, ctx.Err()
-		}
 		return err == nil, nil
 	case <-ctx.Done():
 		return false, ctx.Err()
-	}
-}
-
-func (pe *Pinentry) prompt(req *request, prompt Prompt) {
-	sendResult := func(r Result) {
-		select {
-		case req.pendingResult <- r:
-		case <-time.After(req.timeout):
-			// we expect requests to come in every ~750ms.
-			// If we've been waiting for 2 seconds the client
-			// is likely gone.
-		}
-
-		pe.mu.Lock()
-		pe.activeRequest = nil
-		pe.mu.Unlock()
-	}
-
-	childCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p, cmd, err := launchPinEntry(childCtx)
-	if err != nil {
-		sendResult(Result{
-			OK:    false,
-			Error: fmt.Errorf("failed to start pinentry: %w", err),
-		})
-		return
-	}
-	defer func() {
-		cancel()
-		cmd.Wait()
-	}()
-
-	defer p.Shutdown()
-	prompt.apply(p)
-
-	promptResult := make(chan bool)
-
-	go func() {
-		err := p.Confirm()
-		promptResult <- err == nil
-	}()
-
-	timer := time.NewTimer(req.timeout)
-
-	for {
-		select {
-		case ok := <-promptResult:
-			sendResult(Result{
-				OK: ok,
-			})
-			return
-		case <-timer.C:
-			sendResult(Result{
-				OK:    false,
-				Error: errors.New("request timed out"),
-			})
-			return
-		case d := <-req.extendTimeout:
-			if !timer.Stop() {
-				<-timer.C
-			}
-			timer.Reset(d)
-		}
 	}
 }
 
