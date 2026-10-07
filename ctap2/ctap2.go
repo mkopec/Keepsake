@@ -48,8 +48,13 @@ const (
 	ErrNoCredentials        Status = 0x2E
 	ErrUserActionTimeout    Status = 0x2F
 	ErrNotAllowed           Status = 0x30
+	ErrPinInvalid           Status = 0x31
+	ErrPinBlocked           Status = 0x32
 	ErrPinAuthInvalid       Status = 0x33
+	ErrPinAuthBlocked       Status = 0x34
 	ErrPinNotSet            Status = 0x35
+	ErrPinRequired          Status = 0x36
+	ErrPinPolicyViolation   Status = 0x37
 	ErrOther                Status = 0x7F
 )
 
@@ -146,11 +151,12 @@ type GetAssertionReq struct {
 }
 
 type GetInfoResp struct {
-	Versions   []string        `cbor:"1,keyasint"`
-	Extensions []string        `cbor:"2,keyasint,omitempty"`
-	AAGUID     []byte          `cbor:"3,keyasint"`
-	Options    map[string]bool `cbor:"4,keyasint,omitempty"`
-	MaxMsgSize uint            `cbor:"5,keyasint,omitempty"`
+	Versions     []string        `cbor:"1,keyasint"`
+	Extensions   []string        `cbor:"2,keyasint,omitempty"`
+	AAGUID       []byte          `cbor:"3,keyasint"`
+	Options      map[string]bool `cbor:"4,keyasint,omitempty"`
+	MaxMsgSize   uint            `cbor:"5,keyasint,omitempty"`
+	PinProtocols []uint          `cbor:"6,keyasint,omitempty"`
 }
 
 // PackedAttStmt is a "packed" attestation statement. Without x5c it is a
@@ -172,17 +178,9 @@ type GetAssertionResp struct {
 	Signature  []byte               `cbor:"3,keyasint"`
 }
 
-type coseKeyEC2 struct {
-	Kty int    `cbor:"1,keyasint"`
-	Alg int    `cbor:"3,keyasint"`
-	Crv int    `cbor:"-1,keyasint"`
-	X   []byte `cbor:"-2,keyasint"`
-	Y   []byte `cbor:"-3,keyasint"`
-}
-
 // COSEKeyES256 encodes a P-256 public key as a COSE_Key.
 func COSEKeyES256(x, y *big.Int) ([]byte, error) {
-	return Marshal(coseKeyEC2{
+	return Marshal(COSEKey{
 		Kty: 2, // EC2
 		Alg: AlgES256,
 		Crv: 1, // P-256

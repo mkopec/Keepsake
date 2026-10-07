@@ -27,6 +27,7 @@ import (
 var backend = flag.String("backend", "tpm", "tpm|memory")
 var device = flag.String("device", "/dev/tpmrm0", "TPM device path")
 var counterIndex = flag.Uint("counter-index", tpm.DefaultCounterIndex, "TPM NV index used for the signature counter")
+var pinIndex = flag.Uint("pin-index", tpm.DefaultPINIndex, "TPM NV index used for the clientPIN")
 
 func main() {
 	flag.Parse()
@@ -37,6 +38,8 @@ func main() {
 type server struct {
 	pe     *pinentry.Pinentry
 	signer Signer
+	pins   PINStore
+	pin    *pinState
 }
 
 type Signer interface {
@@ -47,20 +50,23 @@ type Signer interface {
 
 func newServer() *server {
 	s := server{
-		pe: pinentry.New(),
+		pe:  pinentry.New(),
+		pin: newPINState(),
 	}
 	if *backend == "tpm" {
-		signer, err := tpm.New(*device, uint32(*counterIndex))
+		signer, err := tpm.New(*device, uint32(*counterIndex), uint32(*pinIndex))
 		if err != nil {
 			panic(err)
 		}
 		s.signer = signer
+		s.pins = signer
 	} else if *backend == "memory" {
 		signer, err := memory.New()
 		if err != nil {
 			panic(err)
 		}
 		s.signer = signer
+		s.pins = signer
 	}
 	return &s
 }

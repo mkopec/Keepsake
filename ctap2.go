@@ -53,16 +53,28 @@ func (s *server) dispatchCBOR(evt fidohid.AuthEvent, ka *keepalive) (interface{}
 	switch cmd {
 	case ctap2.CmdGetInfo:
 		log.Print("got ctap2 GetInfo")
+		pinSet, err := s.pins.PINSet()
+		if err != nil {
+			return nil, err
+		}
 		return ctap2.GetInfoResp{
 			Versions: []string{"U2F_V2", "FIDO_2_0"},
 			AAGUID:   aaguid,
 			Options: map[string]bool{
-				"rk":   false,
-				"up":   true,
-				"plat": false,
+				"rk":        false,
+				"up":        true,
+				"plat":      false,
+				"clientPin": pinSet,
 			},
-			MaxMsgSize: maxMsgSize,
+			MaxMsgSize:   maxMsgSize,
+			PinProtocols: []uint{2, 1},
 		}, nil
+	case ctap2.CmdClientPIN:
+		var req ctap2.ClientPINReq
+		if err := ctap2.Unmarshal(params, &req); err != nil {
+			return nil, err
+		}
+		return s.clientPIN(&req)
 	case ctap2.CmdMakeCredential:
 		var req ctap2.MakeCredentialReq
 		if err := ctap2.Unmarshal(params, &req); err != nil {
@@ -91,6 +103,10 @@ func (s *server) makeCredential(evt fidohid.AuthEvent, ka *keepalive, req *ctap2
 
 	log.Printf("got ctap2 MakeCredential rp=%s", req.RP.ID)
 
+	if err := s.selectAuthenticator(evt, ka, req.PinUvAuthParam); err != nil {
+		return nil, err
+	}
+
 	es256 := false
 	for _, p := range req.PubKeyCredParams {
 		if p.Type == ctap2.CredentialTypePublic && p.Alg == ctap2.AlgES256 {
@@ -102,14 +118,20 @@ func (s *server) makeCredential(evt fidohid.AuthEvent, ka *keepalive, req *ctap2
 		return nil, ctap2.ErrUnsupportedAlgorithm
 	}
 
-	if err := s.checkPinUvAuthParam(evt, ka, req.PinUvAuthParam); err != nil {
-		return nil, err
-	}
-	if req.Options["rk"] || req.Options["uv"] {
+	if req.Options["rk"] {
 		return nil, ctap2.ErrUnsupportedOption
 	}
 	if up, ok := req.Options["up"]; ok && !up {
 		return nil, ctap2.ErrInvalidOption
+	}
+	if err := s.checkUVOption(req.Options, req.PinUvAuthParam); err != nil {
+		return nil, err
+	}
+
+	// CTAP 2.0 requires the PIN for every registration once it is set.
+	uv, err := s.checkPINUVAuth(req.PinUvAuthParam, req.PinUvAuthProtocol, req.ClientDataHash, true)
+	if err != nil {
+		return nil, err
 	}
 
 	rpIDHash := sha256.Sum256([]byte(req.RP.ID))
@@ -126,7 +148,7 @@ func (s *server) makeCredential(evt fidohid.AuthEvent, ka *keepalive, req *ctap2
 		}
 	}
 
-	desc := fmt.Sprintf("Register with %s\nUser: %s", req.RP.ID, userLabel(req.User))
+	desc := fmt.Sprintf("Register with %s%s\nUser: %s", req.RP.ID, uvSuffix(uv), userLabel(req.User))
 	if err := s.confirmPresence(evt, ka, desc); err != nil {
 		return nil, err
 	}
@@ -144,8 +166,12 @@ func (s *server) makeCredential(evt fidohid.AuthEvent, ka *keepalive, req *ctap2
 		return nil, fmt.Errorf("counter err: %w", err)
 	}
 
+	flags := byte(ctap2.FlagUserPresent)
+	if uv {
+		flags |= ctap2.FlagUserVerified
+	}
 	attested := ctap2.AttestedCredentialData(aaguid, credID, coseKey)
-	authData := ctap2.AuthenticatorData(rpIDHash[:], ctap2.FlagUserPresent, counter, attested)
+	authData := ctap2.AuthenticatorData(rpIDHash[:], flags, counter, attested)
 
 	sig, err := s.signer.SignASN1(credID, rpIDHash[:], signedDigest(authData, req.ClientDataHash))
 	if err != nil {
@@ -169,15 +195,23 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 
 	log.Printf("got ctap2 GetAssertion rp=%s allowList=%d", req.RPID, len(req.AllowList))
 
-	if err := s.checkPinUvAuthParam(evt, ka, req.PinUvAuthParam); err != nil {
+	if err := s.selectAuthenticator(evt, ka, req.PinUvAuthParam); err != nil {
 		return nil, err
 	}
-	if _, ok := req.Options["rk"]; ok || req.Options["uv"] {
+	if _, ok := req.Options["rk"]; ok {
 		return nil, ctap2.ErrUnsupportedOption
+	}
+	if err := s.checkUVOption(req.Options, req.PinUvAuthParam); err != nil {
+		return nil, err
 	}
 	up := true
 	if v, ok := req.Options["up"]; ok {
 		up = v
+	}
+
+	uv, err := s.checkPINUVAuth(req.PinUvAuthParam, req.PinUvAuthProtocol, req.ClientDataHash, false)
+	if err != nil {
+		return nil, err
 	}
 
 	rpIDHash := sha256.Sum256([]byte(req.RPID))
@@ -196,10 +230,13 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 
 	var flags byte
 	if up {
-		if err := s.confirmPresence(evt, ka, fmt.Sprintf("Sign in to %s", req.RPID)); err != nil {
+		if err := s.confirmPresence(evt, ka, fmt.Sprintf("Sign in to %s%s", req.RPID, uvSuffix(uv))); err != nil {
 			return nil, err
 		}
 		flags |= ctap2.FlagUserPresent
+	}
+	if uv {
+		flags |= ctap2.FlagUserVerified
 	}
 
 	counter, err := s.signer.Counter()
@@ -223,18 +260,40 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 	}, nil
 }
 
-// checkPinUvAuthParam handles a pinUvAuthParam sent to an authenticator
-// without clientPIN support. Platforms send a zero length one to let the user
-// pick an authenticator by touching it.
-func (s *server) checkPinUvAuthParam(evt fidohid.AuthEvent, ka *keepalive, param *[]byte) error {
-	if param == nil {
+// checkUVOption handles the "uv" option. There is no built-in user
+// verification, but when a PIN is set the platform can verify the user with
+// it, so the request is answered with PIN_REQUIRED (as libfido2 expects) and
+// the platform retries with a pinUvAuthParam.
+func (s *server) checkUVOption(options map[string]bool, pinUvAuthParam *[]byte) error {
+	if !options["uv"] || pinUvAuthParam != nil {
 		return nil
 	}
-	if len(*param) > 0 {
-		return ctap2.ErrPinAuthInvalid
+	set, err := s.pins.PINSet()
+	if err != nil {
+		return err
+	}
+	if set {
+		return ctap2.ErrPinRequired
+	}
+	return ctap2.ErrUnsupportedOption
+}
+
+// selectAuthenticator handles a zero length pinUvAuthParam, which platforms
+// send to let the user pick an authenticator by touching it. It returns nil
+// for any other pinUvAuthParam.
+func (s *server) selectAuthenticator(evt fidohid.AuthEvent, ka *keepalive, param *[]byte) error {
+	if param == nil || len(*param) > 0 {
+		return nil
 	}
 	if err := s.confirmPresence(evt, ka, "Select this authenticator"); err != nil {
 		return err
+	}
+	set, err := s.pins.PINSet()
+	if err != nil {
+		return err
+	}
+	if set {
+		return ctap2.ErrPinInvalid
 	}
 	return ctap2.ErrPinNotSet
 }

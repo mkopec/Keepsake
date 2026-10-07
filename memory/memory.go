@@ -5,6 +5,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"math/big"
 
@@ -14,6 +15,8 @@ import (
 type Mem struct {
 	masterPrivateKey []byte
 	signCounter      uint32
+	pinHash          []byte
+	pinRetries       int
 }
 
 func New() (*Mem, error) {
@@ -99,4 +102,27 @@ func mustRand(size int) []byte {
 	}
 
 	return b
+}
+
+func (m *Mem) PINSet() (bool, error) {
+	return m.pinHash != nil, nil
+}
+
+func (m *Mem) SetPIN(pinHash []byte, retries int) error {
+	m.pinHash = append([]byte(nil), pinHash...)
+	m.pinRetries = retries
+	return nil
+}
+
+func (m *Mem) PINRetries() (int, error) {
+	return m.pinRetries, nil
+}
+
+func (m *Mem) SetPINRetries(retries int) error {
+	m.pinRetries = retries
+	return nil
+}
+
+func (m *Mem) VerifyPIN(pinHash []byte) (bool, error) {
+	return subtle.ConstantTimeCompare(m.pinHash, pinHash) == 1, nil
 }

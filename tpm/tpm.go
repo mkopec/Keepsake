@@ -10,7 +10,7 @@ import (
 	"math/big"
 	"sync"
 
-	"github.com/google/go-tpm/tpm2"
+	"github.com/google/go-tpm/legacy/tpm2"
 	"github.com/google/go-tpm/tpmutil"
 	"github.com/psanford/tpm-fido/internal/lencode"
 	"golang.org/x/crypto/cryptobyte"
@@ -43,19 +43,21 @@ const counterAttrs = nvTypeCounter | tpm2.AttrAuthWrite | tpm2.AttrAuthRead |
 	tpm2.AttrNoDA | tpm2.AttrOrderly
 
 type TPM struct {
-	devicePath   string
-	counterIndex tpmutil.Handle
-	mu           sync.Mutex
+	devicePath     string
+	counterIndex   tpmutil.Handle
+	pinIndexHandle uint32
+	mu             sync.Mutex
 }
 
 func (t *TPM) open() (io.ReadWriteCloser, error) {
 	return tpm2.OpenTPM(t.devicePath)
 }
 
-func New(devicePath string, counterIndex uint32) (*TPM, error) {
+func New(devicePath string, counterIndex, pinIndex uint32) (*TPM, error) {
 	t := &TPM{
-		devicePath:   devicePath,
-		counterIndex: tpmutil.Handle(counterIndex),
+		devicePath:     devicePath,
+		counterIndex:   tpmutil.Handle(counterIndex),
+		pinIndexHandle: pinIndex,
 	}
 
 	tpm, err := t.open()
@@ -88,7 +90,27 @@ func (t *TPM) ensureCounter(tpm io.ReadWriter) error {
 	return nil
 }
 
-func primaryKeyTmpl(seed, applicationParam []byte) tpm2.Public {
+// keyHandleVersionNoDA prefixes the seed in key handles whose keys have
+// noDA set. The keys have an empty authValue, so dictionary attack
+// protection doesn't protect anything; without noDA they can't be used while
+// the TPM is in lockout, e.g. after wrong PIN guesses. Key handles with a
+// bare 20 byte seed were created without noDA. The flag changes the primary
+// key template, so it can't be changed for existing key handles.
+const keyHandleVersionNoDA = 0x01
+
+// parseSeed splits the seed field of a key handle into the HKDF seed and
+// the key attributes to use.
+func parseSeed(field []byte) (seed []byte, noDA bool, err error) {
+	switch {
+	case len(field) == seedSizeBytes:
+		return field, false, nil
+	case len(field) == seedSizeBytes+1 && field[0] == keyHandleVersionNoDA:
+		return field[1:], true, nil
+	}
+	return nil, false, fmt.Errorf("invalid key handle seed")
+}
+
+func primaryKeyTmpl(seed, applicationParam []byte, noDA bool) tpm2.Public {
 	info := append([]byte("tpm-fido-application-key"), applicationParam...)
 
 	r := hkdf.New(sha256.New, seed, []byte{}, info)
@@ -103,12 +125,17 @@ func primaryKeyTmpl(seed, applicationParam []byte) tpm2.Public {
 		panic(err)
 	}
 
+	attrs := tpm2.FlagRestricted | tpm2.FlagDecrypt |
+		tpm2.FlagFixedTPM | tpm2.FlagFixedParent |
+		tpm2.FlagSensitiveDataOrigin | tpm2.FlagUserWithAuth
+	if noDA {
+		attrs |= tpm2.FlagNoDA
+	}
+
 	return tpm2.Public{
-		Type:    tpm2.AlgECC,
-		NameAlg: tpm2.AlgSHA256,
-		Attributes: tpm2.FlagRestricted | tpm2.FlagDecrypt |
-			tpm2.FlagFixedTPM | tpm2.FlagFixedParent |
-			tpm2.FlagSensitiveDataOrigin | tpm2.FlagUserWithAuth,
+		Type:       tpm2.AlgECC,
+		NameAlg:    tpm2.AlgSHA256,
+		Attributes: attrs,
 		ECCParameters: &tpm2.ECCParams{
 			Symmetric: &tpm2.SymScheme{
 				Alg:     tpm2.AlgAES,
@@ -160,15 +187,16 @@ func (t *TPM) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, 
 	defer tpm.Close()
 
 	randSeed := mustRand(seedSizeBytes)
+	seedField := append([]byte{keyHandleVersionNoDA}, randSeed...)
 
-	primaryTmpl := primaryKeyTmpl(randSeed, applicationParam)
+	primaryTmpl := primaryKeyTmpl(randSeed, applicationParam, true)
 
 	childTmpl := tpm2.Public{
 		Type:    tpm2.AlgECC,
 		NameAlg: tpm2.AlgSHA256,
 		Attributes: tpm2.FlagFixedTPM | tpm2.FlagFixedParent |
 			tpm2.FlagSensitiveDataOrigin | tpm2.FlagUserWithAuth |
-			tpm2.FlagSign,
+			tpm2.FlagSign | tpm2.FlagNoDA,
 		ECCParameters: &tpm2.ECCParams{
 
 			Sign: &tpm2.SigScheme{
@@ -200,7 +228,7 @@ func (t *TPM) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, 
 
 	enc.Encode(private)
 	enc.Encode(public)
-	enc.Encode(randSeed)
+	enc.Encode(seedField)
 
 	keyHandle, _, err := tpm2.Load(tpm, parentHandle, "", public, private)
 	if err != nil {
@@ -244,7 +272,7 @@ func (t *TPM) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, erro
 		return nil, invalidHandleErr
 	}
 
-	seed, err := dec.Decode()
+	seedField, err := dec.Decode()
 	if err != nil {
 		return nil, invalidHandleErr
 	}
@@ -254,7 +282,12 @@ func (t *TPM) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, erro
 		return nil, invalidHandleErr
 	}
 
-	srkTemplate := primaryKeyTmpl(seed, applicationParam)
+	seed, noDA, err := parseSeed(seedField)
+	if err != nil {
+		return nil, invalidHandleErr
+	}
+
+	srkTemplate := primaryKeyTmpl(seed, applicationParam, noDA)
 
 	parentHandle, _, err := tpm2.CreatePrimary(tpm, tpm2.HandleOwner, tpm2.PCRSelection{}, "", "", srkTemplate)
 	if err != nil {
