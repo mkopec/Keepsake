@@ -32,11 +32,36 @@ type secure struct {
 	tpm transport.TPM
 	srk *tpm2.CreatePrimaryResponse
 	pub tpm2.TPMTPublic
+	// persistent SRKs aren't flushed
+	persistent bool
 }
+
+// Creating the SRK (an ECC primary key) is one of the slowest TPM
+// operations, and tpm-fido needs it several times per request. If the TPM
+// has a persistent SRK with the same (deterministic) template, it is used
+// instead: at the handles TCG's provisioning guidance and systemd use, or
+// at tpm-fido's own handle, where tpm-fido persists it if neither exists.
+// The SRK carries no secrets; it is shared by all users.
+var srkHandles = []uint32{0x81000001, 0x81000002}
+
+const tpmFidoSRKHandle = 0x81310000
 
 // secure loads the SRK and checks it against the pinned name. The caller
 // must call close.
 func (t *TPM) secure(tpm transport.TPM) (*secure, error) {
+	if t.srkHandle != 0 {
+		rsp, err := tpm2.ReadPublic{ObjectHandle: tpm2.TPMHandle(t.srkHandle)}.Execute(tpm)
+		if err == nil {
+			if pub, err := rsp.OutPublic.Contents(); err == nil {
+				if name, err := tpm2.ObjectName(pub); err == nil && subtle.ConstantTimeCompare(name.Buffer, t.srkName) == 1 {
+					srk := &tpm2.CreatePrimaryResponse{ObjectHandle: tpm2.TPMHandle(t.srkHandle), Name: *name, OutPublic: rsp.OutPublic}
+					return &secure{tpm: tpm, srk: srk, pub: *pub, persistent: true}, nil
+				}
+			}
+		}
+		// evicted or replaced: fall back to creating it
+		t.srkHandle = 0
+	}
 	srk, err := createSRK(tpm)
 	if err != nil {
 		return nil, err
@@ -61,7 +86,39 @@ func (t *TPM) secure(tpm transport.TPM) (*secure, error) {
 }
 
 func (s *secure) close() {
-	flush(s.tpm, s.srk.ObjectHandle)
+	if !s.persistent {
+		flush(s.tpm, s.srk.ObjectHandle)
+	}
+}
+
+// findPersistentSRK looks for a persistent SRK with the pinned name, and
+// persists sec's SRK at tpm-fido's handle if there is none.
+func (t *TPM) findPersistentSRK(tpm transport.TPM, sec *secure) {
+	for _, h := range append(srkHandles, tpmFidoSRKHandle) {
+		rsp, err := tpm2.ReadPublic{ObjectHandle: tpm2.TPMHandle(h)}.Execute(tpm)
+		if err != nil {
+			continue
+		}
+		pub, err := rsp.OutPublic.Contents()
+		if err != nil {
+			continue
+		}
+		if name, err := tpm2.ObjectName(pub); err == nil && bytes.Equal(name.Buffer, t.srkName) {
+			t.srkHandle = h
+			return
+		}
+	}
+	if sec.persistent {
+		return
+	}
+	_, err := tpm2.EvictControl{
+		Auth:             ownerAuth,
+		ObjectHandle:     tpm2.NamedHandle{Handle: sec.srk.ObjectHandle, Name: sec.srk.Name},
+		PersistentHandle: tpm2.TPMIDHPersistent(tpmFidoSRKHandle),
+	}.Execute(tpm)
+	if err == nil {
+		t.srkHandle = tpmFidoSRKHandle
+	}
 }
 
 // auth returns a one-time salted HMAC session proving knowledge of
@@ -108,6 +165,7 @@ func (t *TPM) pinSRK(tpm transport.TPM, path string) error {
 			return fmt.Errorf("pin SRK err: %w", err)
 		}
 		t.srkName = name.Buffer
+		t.findPersistentSRK(tpm, s)
 		return nil
 	}
 	if err != nil {
@@ -119,5 +177,6 @@ func (t *TPM) pinSRK(tpm transport.TPM, path string) error {
 			"delete %s", ErrSRKMismatch, path)
 	}
 	t.srkName = pinned
+	t.findPersistentSRK(tpm, s)
 	return nil
 }

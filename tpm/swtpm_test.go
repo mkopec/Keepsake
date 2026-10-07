@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -577,5 +578,73 @@ func TestFormatV2StillWorks(t *testing.T) {
 		if err != nil || !ecdsa.VerifyASN1(&ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}, d[:], sig) {
 			t.Fatalf("%+v: %v", o, err)
 		}
+	}
+}
+
+// countingConn counts TPM2_CreatePrimary commands.
+type countingConn struct {
+	io.ReadWriteCloser
+	n *int
+}
+
+func (c countingConn) Write(p []byte) (int, error) {
+	// header: tag(2) size(4) command code(4)
+	if len(p) >= 10 && binary.BigEndian.Uint32(p[6:10]) == uint32(tpm2.TPMCCCreatePrimary) {
+		*c.n++
+	}
+	return c.ReadWriteCloser.Write(p)
+}
+
+func TestPersistentSRKReused(t *testing.T) {
+	tp, _, _ := swtpm(t)
+	if tp.srkHandle == 0 {
+		t.Fatal("no persistent SRK")
+	}
+	sock := os.Getenv("TPMFIDO_SWTPM")
+	var n int
+	tp.dial = func() (io.ReadWriteCloser, error) {
+		rwc, err := tpmutil.OpenTPM(sock)
+		return countingConn{rwc, &n}, err
+	}
+	rp := sha256.Sum256([]byte("example.com"))
+	kh, _, _, err := tp.RegisterKey(rp[:], KeyOptions{HMACSecret: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := sha256.Sum256([]byte("m"))
+	n = 0
+	if _, err := tp.SignASN1(kh, rp[:], d[:], nil); err != nil {
+		t.Fatal(err)
+	}
+	// only the credential's own parent key
+	if n != 1 {
+		t.Fatalf("%d CreatePrimary commands for one signature", n)
+	}
+	n = 0
+	if _, err := tp.HMACSecret(kh, rp[:], nil); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("%d CreatePrimary commands for hmac-secret", n)
+	}
+
+	// an evicted persistent SRK falls back to creating one
+	err = tp.withTPM(func(tpm transport.TPM) error {
+		rsp, err := tpm2.ReadPublic{ObjectHandle: tpm2.TPMHandle(tp.srkHandle)}.Execute(tpm)
+		if err != nil {
+			return err
+		}
+		_, err = tpm2.EvictControl{Auth: ownerAuth, ObjectHandle: tpm2.NamedHandle{Handle: tpm2.TPMHandle(tp.srkHandle), Name: rsp.Name},
+			PersistentHandle: tpm2.TPMIDHPersistent(tp.srkHandle)}.Execute(tpm)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tp.SignASN1(kh, rp[:], d[:], nil); err != nil {
+		t.Fatalf("after evicting the SRK: %v", err)
+	}
+	if tp.srkHandle != 0 {
+		t.Fatal("still using the evicted SRK")
 	}
 }

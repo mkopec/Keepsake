@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/psanford/tpm-fido/fidoauth"
 	"github.com/psanford/uhid"
@@ -87,26 +88,50 @@ func (t *SoftToken) Run(ctx context.Context) {
 	// only the most recent maxChannels are remembered. Every program that
 	// can open the device sees all responses, including channel IDs, so
 	// this only stops blind interference.
-	channels := make(map[uint32]bool)
-	var channelOrder []uint32
+	//
+	// When maxChannels are allocated, the least recently used one is
+	// dropped, never the one with a transaction in progress: a program
+	// allocating many channels can't evict the browser's channel in the
+	// middle of a request.
+	channels := make(map[uint32]time.Time) // last use
+	touch := func(ch uint32) {
+		if _, ok := channels[ch]; ok {
+			channels[ch] = time.Now()
+		}
+	}
 	allocateChan := func() uint32 {
+		if len(channels) >= maxChannels {
+			var oldest uint32
+			var oldestT time.Time
+			t.mu.Lock()
+			busy, busyCh := t.busy, t.busyChanID
+			t.mu.Unlock()
+			for ch, used := range channels {
+				if busy && ch == busyCh {
+					continue
+				}
+				if oldest == 0 || used.Before(oldestT) {
+					oldest, oldestT = ch, used
+				}
+			}
+			delete(channels, oldest)
+		}
 		for {
 			var b [4]byte
 			if _, err := rand.Read(b[:]); err != nil {
 				panic(err)
 			}
 			k := binary.BigEndian.Uint32(b[:])
-			if k == 0 || k == broadcastChannel || channels[k] {
+			if _, used := channels[k]; k == 0 || k == broadcastChannel || used {
 				continue
 			}
-			channels[k] = true
-			channelOrder = append(channelOrder, k)
-			if len(channelOrder) > maxChannels {
-				delete(channels, channelOrder[0])
-				channelOrder = channelOrder[1:]
-			}
+			channels[k] = time.Now()
 			return k
 		}
+	}
+	allocated := func(ch uint32) bool {
+		_, ok := channels[ch]
+		return ok
 	}
 
 	pktChan := make(chan Packet)
@@ -120,7 +145,10 @@ func (t *SoftToken) Run(ctx context.Context) {
 			cmd       CmdType
 		)
 
-		var nextSeq byte
+		var (
+			nextSeq byte
+			started time.Time
+		)
 		for pkt := range pktChan {
 			if !pkt.IsInitial && (pkt.ChannelID != reqChanID || innerMsg == nil) {
 				log.Printf("dropping continuation packet for channel 0x%08x", pkt.ChannelID)
@@ -131,10 +159,19 @@ func (t *SoftToken) Run(ctx context.Context) {
 				innerMsg = nil
 				continue
 			}
+			// Another channel can't interrupt a message being
+			// reassembled (it gets ERR_CHANNEL_BUSY), unless the
+			// sender stopped sending it.
+			if pkt.IsInitial && innerMsg != nil && pkt.ChannelID != reqChanID &&
+				time.Since(started) < reassemblyTimeout {
+				t.writeError(pkt.ChannelID, errChannelBusy)
+				continue
+			}
 			if pkt.IsInitial {
 				if len(innerMsg) > 0 {
 					log.Print("new initial packet while pending packets still exist")
 				}
+				started = time.Now()
 				innerMsg = make([]byte, 0, pkt.TotalSize)
 				nextSeq = 0
 				needSize = pkt.TotalSize
@@ -157,6 +194,11 @@ func (t *SoftToken) Run(ctx context.Context) {
 
 		switch cmd {
 		case CmdPing:
+			if !allocated(reqChanID) {
+				t.writeError(reqChanID, errInvalidChannel)
+				continue
+			}
+			touch(reqChanID)
 			err := t.writeMessage(reqChanID, CmdPing, innerMsg)
 			if err != nil {
 				log.Printf("Write ping resp err: %s", err)
@@ -168,7 +210,7 @@ func (t *SoftToken) Run(ctx context.Context) {
 			}
 			t.mu.Unlock()
 		case CmdInit:
-			if reqChanID != broadcastChannel && !channels[reqChanID] {
+			if reqChanID != broadcastChannel && !allocated(reqChanID) {
 				t.writeError(reqChanID, errInvalidChannel)
 				continue
 			}
@@ -185,10 +227,11 @@ func (t *SoftToken) Run(ctx context.Context) {
 				continue
 			}
 		case CmdMsg, CmdCbor:
-			if !channels[reqChanID] {
+			if !allocated(reqChanID) {
 				t.writeError(reqChanID, errInvalidChannel)
 				continue
 			}
+			touch(reqChanID)
 			txCtx, ok := t.beginTx(ctx, reqChanID)
 			if !ok {
 				t.writeError(reqChanID, errChannelBusy)
@@ -263,6 +306,10 @@ const (
 
 	broadcastChannel = 0xffffffff
 	maxChannels      = 256
+
+	// a message whose continuation packets don't arrive within this time
+	// can be interrupted by another channel
+	reassemblyTimeout = 3 * time.Second
 
 	// CTAPHID_KEEPALIVE status codes
 	KeepaliveProcessing = 0x01

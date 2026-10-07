@@ -91,6 +91,8 @@ type TPM struct {
 
 	// pinned SRK name, set by New
 	srkName []byte
+	// persistent handle of the SRK, 0 if it is created when needed
+	srkHandle uint32
 	// set by New
 	userSecret []byte
 

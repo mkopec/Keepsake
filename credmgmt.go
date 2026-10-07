@@ -165,6 +165,9 @@ func (s *server) checkCredMgmtAuth(req *ctap2.CredMgmtReq) error {
 	if !set {
 		return ctap2.ErrPinNotSet
 	}
+	if s.pin.sshOnly {
+		return ctap2.ErrPinAuthInvalid
+	}
 	msg := append([]byte{byte(req.SubCommand)}, req.SubCommandParams...)
 	if !ctap2.VerifyPINAuth(proto, s.pin.pinToken, msg, req.PinUvAuthParam) {
 		return ctap2.ErrPinAuthInvalid

@@ -92,3 +92,44 @@ func TestPINTokenExpiry(t *testing.T) {
 		}
 	}
 }
+
+func TestAskpassToken(t *testing.T) {
+	var g presenceGrant
+	token := g.set("1234")
+	if token == "1234" || len(token) < 4 || len(token) > 63 {
+		t.Fatalf("bad token %q", token)
+	}
+	if g.resolve(pinHash("1234")) != nil {
+		t.Fatal("the real PIN must not resolve")
+	}
+	real := g.resolve(pinHash(token))
+	if string(real) != string(pinHash("1234")) {
+		t.Fatal("token didn't resolve to the PIN")
+	}
+	if g.resolve(pinHash(token)) != nil {
+		t.Fatal("token resolved twice")
+	}
+	// the presence grant is still there for the request that follows
+	if !g.consume(pinHash("1234")) {
+		t.Fatal("presence grant lost")
+	}
+
+	token = g.set("1234")
+	g.expires = time.Now().Add(-time.Second)
+	if g.resolve(pinHash(token)) != nil {
+		t.Fatal("expired token resolved")
+	}
+}
+
+func TestSSHOnlyPINToken(t *testing.T) {
+	s := &server{pin: newPINState(), pins: alwaysPIN{}}
+	s.pin.sshOnly = true
+	cdh := make([]byte, 32)
+	param := ctap2PINAuth(s.pin.pinToken, cdh)
+	if _, err := s.checkPINUVAuth(&param, 2, cdh, false, "github.com"); err == nil {
+		t.Fatal("ssh-only pinToken accepted for a website")
+	}
+	if uv, err := s.checkPINUVAuth(&param, 2, cdh, false, "ssh:"); !uv || err != nil {
+		t.Fatalf("ssh: %v %v", uv, err)
+	}
+}

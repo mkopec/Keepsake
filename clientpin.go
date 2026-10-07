@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"log"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -47,8 +48,11 @@ type pinState struct {
 	pinToken     []byte
 	// pinHash is the hash of the PIN that pinToken was issued for. It is
 	// needed to use the TPM's UV key for hmac-secret.
-	pinHash             []byte
-	tokenExpires        time.Time
+	pinHash      []byte
+	tokenExpires time.Time
+	// sshOnly is set if the pinToken was issued for an askpass token:
+	// it is only valid for SSH relying parties
+	sshOnly             bool
 	consecutiveFailures int
 }
 
@@ -80,6 +84,7 @@ func (ps *pinState) regeneratePINToken() {
 	clear(ps.pinHash)
 	ps.pinToken = mustRand(32)
 	ps.pinHash = nil
+	ps.sshOnly = false
 }
 
 func (s *server) clientPIN(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.ClientPINReq) (interface{}, error) {
@@ -195,7 +200,7 @@ func (s *server) changePIN(proto ctap2.PINProtocol, req *ctap2.ClientPINReq) err
 	if !ctap2.VerifyPINAuth(proto, shared, msg, req.PinAuth) {
 		return ctap2.ErrPinAuthInvalid
 	}
-	oldPinHash, err := s.verifyPINHash(proto, shared, req.PinHashEnc)
+	oldPinHash, _, err := s.verifyPINHash(proto, shared, req.PinHashEnc, false)
 	if err != nil {
 		return err
 	}
@@ -228,43 +233,52 @@ func (s *server) getPINToken(proto ctap2.PINProtocol, req *ctap2.ClientPINReq) (
 	if err != nil {
 		return nil, err
 	}
-	pinHash, err := s.verifyPINHash(proto, shared, req.PinHashEnc)
+	pinHash, sshOnly, err := s.verifyPINHash(proto, shared, req.PinHashEnc, true)
 	if err != nil {
 		return nil, err
 	}
 
 	s.pin.regeneratePINToken()
 	s.pin.pinHash = pinHash
+	s.pin.sshOnly = sshOnly
 	s.pin.tokenExpires = time.Now().Add(pinTokenLifetime)
 	return ctap2.ClientPINResp{PinToken: proto.Encrypt(shared, s.pin.pinToken)}, nil
 }
 
 // verifyPINHash checks the encrypted PIN hash sent by the platform against
 // the stored PIN, maintaining the retry counters. It returns the PIN hash.
-func (s *server) verifyPINHash(proto ctap2.PINProtocol, shared, pinHashEnc []byte) ([]byte, error) {
+// With allowAskpassToken, the hash of an askpass token (see
+// askpassservice.go) stands for the PIN the user typed, and sshOnly is
+// returned true.
+func (s *server) verifyPINHash(proto ctap2.PINProtocol, shared, pinHashEnc []byte, allowAskpassToken bool) (pinHash []byte, sshOnly bool, err error) {
 	retries, err := s.pins.PINRetries()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if retries <= 0 {
-		return nil, ctap2.ErrPinBlocked
+		return nil, false, ctap2.ErrPinBlocked
 	}
 	if s.pin.consecutiveFailures >= maxConsecutivePINFailures {
-		return nil, ctap2.ErrPinAuthBlocked
+		return nil, false, ctap2.ErrPinAuthBlocked
 	}
 
-	pinHash, err := proto.Decrypt(shared, pinHashEnc)
+	pinHash, err = proto.Decrypt(shared, pinHashEnc)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if len(pinHash) != 16 {
-		return nil, ctap2.ErrInvalidParameter
+		return nil, false, ctap2.ErrInvalidParameter
+	}
+	if allowAskpassToken {
+		if real := s.grant.resolve(pinHash); real != nil {
+			pinHash, sshOnly = real, true
+		}
 	}
 
 	// Count the attempt before checking it, so that cutting power (killing
 	// tpm-fido) after a wrong guess doesn't save a retry.
 	if err := s.pins.SetPINRetries(retries - 1); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	ok, err := s.pins.VerifyPIN(pinHash)
@@ -272,12 +286,12 @@ func (s *server) verifyPINHash(proto ctap2.PINProtocol, shared, pinHashEnc []byt
 		// The TPM didn't check the PIN, so don't count the attempt.
 		log.Printf("PIN check refused: %s", err)
 		if err := s.pins.SetPINRetries(retries); err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return nil, ctap2.ErrPinAuthBlocked
+		return nil, false, ctap2.ErrPinAuthBlocked
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if !ok {
@@ -286,18 +300,18 @@ func (s *server) verifyPINHash(proto ctap2.PINProtocol, shared, pinHashEnc []byt
 		log.Printf("wrong PIN, %d retries left", retries-1)
 		switch {
 		case retries-1 <= 0:
-			return nil, ctap2.ErrPinBlocked
+			return nil, false, ctap2.ErrPinBlocked
 		case s.pin.consecutiveFailures >= maxConsecutivePINFailures:
-			return nil, ctap2.ErrPinAuthBlocked
+			return nil, false, ctap2.ErrPinAuthBlocked
 		}
-		return nil, ctap2.ErrPinInvalid
+		return nil, false, ctap2.ErrPinInvalid
 	}
 
 	s.pin.consecutiveFailures = 0
 	if err := s.pins.SetPINRetries(maxPINRetries); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return pinHash, nil
+	return pinHash, sshOnly, nil
 }
 
 // decryptNewPIN decrypts and validates a padded new PIN and returns its
@@ -327,7 +341,7 @@ func decryptNewPIN(proto ctap2.PINProtocol, shared, newPinEnc []byte) ([]byte, e
 // checkPINUVAuth handles the pinUvAuthParam of MakeCredential and
 // GetAssertion. It returns true if the request was authorized with a valid
 // pinToken (user verified).
-func (s *server) checkPINUVAuth(param *[]byte, protocol uint, clientDataHash []byte, pinRequired bool) (bool, error) {
+func (s *server) checkPINUVAuth(param *[]byte, protocol uint, clientDataHash []byte, pinRequired bool, rpID string) (bool, error) {
 	set, err := s.pins.PINSet()
 	if err != nil {
 		return false, err
@@ -351,6 +365,10 @@ func (s *server) checkPINUVAuth(param *[]byte, protocol uint, clientDataHash []b
 		return false, ctap2.ErrPinNotSet
 	}
 	if !ctap2.VerifyPINAuth(proto, s.pin.pinToken, clientDataHash, *param) {
+		return false, ctap2.ErrPinAuthInvalid
+	}
+	if s.pin.sshOnly && !strings.HasPrefix(rpID, "ssh:") {
+		log.Print("pinToken issued for an askpass token used for a non-SSH relying party, refused")
 		return false, ctap2.ErrPinAuthInvalid
 	}
 	return true, nil
