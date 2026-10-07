@@ -11,9 +11,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/psanford/tpm-fido/src/ctap2"
-	"github.com/psanford/tpm-fido/src/fidohid"
-	"github.com/psanford/tpm-fido/src/tpm"
+	"github.com/mkopec/keepsake/src/ctap2"
+	"github.com/mkopec/keepsake/src/fidohid"
+	"github.com/mkopec/keepsake/src/tpm"
 )
 
 const (
@@ -41,7 +41,7 @@ type PINStore interface {
 	VerifyPIN(pinHash []byte) (bool, error)
 }
 
-// pinState is the volatile clientPIN state, reset when tpm-fido restarts
+// pinState is the volatile clientPIN state, reset when Keepsake restarts
 // (the equivalent of an authenticator power cycle).
 type pinState struct {
 	keyAgreement *ecdh.PrivateKey
@@ -165,7 +165,7 @@ func (s *server) setPIN(evt fidohid.AuthEvent, ka *keepalive, proto ctap2.PINPro
 		return err
 	}
 
-	// CTAP doesn't need user presence to set the first PIN, but tpm-fido
+	// CTAP doesn't need user presence to set the first PIN, but Keepsake
 	// is never unplugged: without it, any program that can open the
 	// device could set a PIN the user doesn't know.
 	if err := s.confirmPresence(evt, ka, setPINPrompt()); err != nil {
@@ -276,7 +276,7 @@ func (s *server) verifyPINHash(proto ctap2.PINProtocol, shared, pinHashEnc []byt
 	}
 
 	// Count the attempt before checking it, so that cutting power (killing
-	// tpm-fido) after a wrong guess doesn't save a retry.
+	// Keepsake) after a wrong guess doesn't save a retry.
 	if err := s.pins.SetPINRetries(retries - 1); err != nil {
 		return nil, false, err
 	}

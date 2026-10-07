@@ -2,7 +2,7 @@
 //
 // The credentials themselves are self-contained TPM key handles; the store
 // only makes them discoverable (and, for credentials flagged as
-// discoverable, usable: tpm-fido refuses a discoverable credential that
+// discoverable, usable: Keepsake refuses a discoverable credential that
 // isn't in the store, so deleting it revokes it). The store is a single
 // file encrypted with AES-256-GCM under a key derived from the TPM device
 // key, so it can only be read on this TPM and becomes unreadable after a
@@ -69,7 +69,7 @@ type Store struct {
 	AllowUnversioned bool
 }
 
-// DefaultPath returns $XDG_DATA_HOME/tpm-fido/passkeys.
+// DefaultPath returns $XDG_DATA_HOME/keepsake/passkeys.
 func DefaultPath() (string, error) {
 	dir := os.Getenv("XDG_DATA_HOME")
 	if dir == "" {
@@ -79,7 +79,29 @@ func DefaultPath() (string, error) {
 		}
 		dir = filepath.Join(home, ".local", "share")
 	}
-	return filepath.Join(dir, "tpm-fido", "passkeys"), nil
+	return filepath.Join(dir, "keepsake", "passkeys"), nil
+}
+
+// MigrateDataDir moves the data directory of versions named tpm-fido
+// ($XDG_DATA_HOME/tpm-fido) to the directory of path, if that doesn't exist
+// yet. It holds the user secret: without it, no credential can be used.
+func MigrateDataDir(path string) (bool, error) {
+	newDir := filepath.Dir(path)
+	oldDir := filepath.Join(filepath.Dir(newDir), "tpm-fido")
+	if _, err := os.Lstat(newDir); err == nil || !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	fi, err := os.Lstat(oldDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !fi.IsDir() {
+		return false, nil
+	}
+	return true, os.Rename(oldDir, newDir)
 }
 
 func (s *Store) aead() (cipher.AEAD, error) {

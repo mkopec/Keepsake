@@ -9,8 +9,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/psanford/tpm-fido/src/ctap2"
-	"github.com/psanford/tpm-fido/src/passkeys"
+	"github.com/mkopec/keepsake/src/ctap2"
+	"github.com/mkopec/keepsake/src/passkeys"
 )
 
 // nextAssertionTimeout is how long GetNextAssertion can be called after
@@ -51,7 +51,7 @@ func (s *server) migratePasskeyStore() error {
 }
 
 // loadPasskeys loads the passkey store. A store that can't be decrypted
-// (after the TPM was cleared, or the device key replaced outside tpm-fido)
+// (after the TPM was cleared, or the device key replaced outside Keepsake)
 // is moved aside, since its passkeys can't be used anymore.
 func (s *server) loadPasskeys() ([]passkeys.Credential, error) {
 	creds, err := s.passkeys.Load()
@@ -61,7 +61,7 @@ func (s *server) loadPasskeys() ([]passkeys.Credential, error) {
 			return nil, fmt.Errorf("%w; moving it aside failed: %s", err, merr)
 		}
 		if errors.Is(err, passkeys.ErrRolledBack) {
-			log.Printf("WARNING: the passkey store is older than the last one tpm-fido saved (restored from a backup?); "+
+			log.Printf("WARNING: the passkey store is older than the last one Keepsake saved (restored from a backup?); "+
 				"it could bring back deleted passkeys, so it was moved to %s and isn't used", name)
 		} else {
 			log.Printf("passkey store can't be decrypted with this TPM, moved it to %s", name)

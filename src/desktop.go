@@ -9,14 +9,14 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
-	"github.com/psanford/tpm-fido/src/gnome"
-	"github.com/psanford/tpm-fido/src/pinentry"
-	"github.com/psanford/tpm-fido/src/ui"
+	"github.com/mkopec/keepsake/src/gnome"
+	"github.com/mkopec/keepsake/src/pinentry"
+	"github.com/mkopec/keepsake/src/ui"
 )
 
 var promptBackend = flag.String("prompt", "auto", "confirmation dialogs: auto (GNOME system prompt if available, else pinentry), gnome or pinentry")
 var lockCheck = flag.Bool("lock-check", true, "refuse requests while the session is locked or inactive")
-var askpassServiceFlag = flag.Bool("askpass-service", true, "let tpm-fido-askpass ask for SSH security key PINs through tpm-fido (one prompt instead of two)")
+var askpassServiceFlag = flag.Bool("askpass-service", true, "let keepsake-askpass ask for SSH security key PINs through Keepsake (one prompt instead of two)")
 
 // Locker reports whether the user's session is locked.
 type Locker interface {
@@ -48,7 +48,7 @@ func (s *server) setupDesktop() error {
 	}
 	if confirmer == nil {
 		if pinentry.FindPinentryGUIPath() == "" {
-			log.Printf("warning: no gui pinentry binary detected in PATH. tpm-fido may not work correctly without a gui based pinentry")
+			log.Printf("warning: no gui pinentry binary detected in PATH. Keepsake may not work correctly without a gui based pinentry")
 		}
 		log.Print("showing dialogs with pinentry")
 		confirmer = pinentry.New()

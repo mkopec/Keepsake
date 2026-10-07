@@ -4,14 +4,14 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/psanford/tpm-fido/src/fidohid"
+	"github.com/mkopec/keepsake/src/fidohid"
 )
 
 // reset handles authenticatorReset: it irrecoverably invalidates every
 // credential, deletes the passkeys and removes the PIN.
 //
 // Hardware authenticators only accept a reset shortly after being plugged
-// in. tpm-fido has no equivalent of plugging in, so it relies on the user
+// in. Keepsake has no equivalent of plugging in, so it relies on the user
 // confirming the reset instead.
 func (s *server) reset(evt fidohid.AuthEvent, ka *keepalive) (interface{}, error) {
 	log.Print("got ctap2 Reset")

@@ -1,5 +1,5 @@
-"""Security key operations for tpm-fido-settings, using standard CTAP2
-commands through python-fido2, so they work with tpm-fido and with hardware
+"""Security key operations for keepsake-settings, using standard CTAP2
+commands through python-fido2, so they work with Keepsake and with hardware
 security keys."""
 
 from dataclasses import dataclass
@@ -10,7 +10,7 @@ from fido2.ctap2.credman import CredentialManagement
 from fido2.ctap2.pin import ClientPin
 from fido2.hid import CtapHidDevice
 
-TPM_FIDO_VID, TPM_FIDO_PID = 0x15D9, 0x0A37
+KEEPSAKE_VID, KEEPSAKE_PID = 0x15D9, 0x0A37
 
 ERR = CtapError.ERR
 
@@ -28,7 +28,7 @@ def describe_error(e: CtapError, retries: int | None = None) -> str:
     if code == ERR.PIN_BLOCKED:
         return "The PIN is blocked after too many incorrect attempts. Reset the security key to use it again."
     if code == ERR.PIN_AUTH_BLOCKED:
-        return "Too many incorrect PINs. Unplug the security key (or restart tpm-fido) and try again."
+        return "Too many incorrect PINs. Unplug the security key (or restart Keepsake) and try again."
     if code == ERR.PIN_POLICY_VIOLATION:
         return "The security key doesn’t accept this PIN. Use at least 4 characters."
     if code in (ERR.OPERATION_DENIED, ERR.KEEPALIVE_CANCEL):
@@ -70,13 +70,13 @@ class SecurityKey:
         return self.dev.descriptor.path
 
     @property
-    def is_tpm_fido(self) -> bool:
+    def is_keepsake(self) -> bool:
         d = self.dev.descriptor
-        return (d.vid, d.pid) == (TPM_FIDO_VID, TPM_FIDO_PID)
+        return (d.vid, d.pid) == (KEEPSAKE_VID, KEEPSAKE_PID)
 
     @property
     def name(self) -> str:
-        if self.is_tpm_fido:
+        if self.is_keepsake:
             return "TPM Security Key"
         return self.dev.descriptor.product_name or "Security Key"
 
@@ -158,6 +158,6 @@ def list_keys() -> list[SecurityKey]:
         except Exception:
             # U2F-only keys don't support CTAP2
             continue
-    # tpm-fido first
-    keys.sort(key=lambda k: not k.is_tpm_fido)
+    # Keepsake first
+    keys.sort(key=lambda k: not k.is_keepsake)
     return keys

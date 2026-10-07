@@ -1,23 +1,23 @@
-// tpm-fido-askpass is an SSH_ASKPASS program for GNOME. OpenSSH runs it
+// keepsake-askpass is an SSH_ASKPASS program for GNOME. OpenSSH runs it
 // with the prompt as its only argument and the kind of prompt in
 // SSH_ASKPASS_PROMPT:
 //
 //   - unset: a passphrase or security key PIN, printed on stdout. If
-//     tpm-fido runs, it asks for security key PINs itself: one prompt both
+//     Keepsake runs, it asks for security key PINs itself: one prompt both
 //     takes the PIN and confirms the signature, instead of a PIN prompt
-//     followed by tpm-fido's confirmation. Otherwise, and for passphrases,
+//     followed by Keepsake's confirmation. Otherwise, and for passphrases,
 //     it asks with the GNOME system prompt.
 //   - "confirm": a yes/no question, answered with the exit status.
 //   - "none": a notification ("Confirm user presence for key ..."), shown
 //     until ssh kills the program. It is shown as a desktop notification,
-//     unless tpm-fido is handling the request and shows its own dialog.
+//     unless Keepsake is handling the request and shows its own dialog.
 //
 // Without a GNOME system prompter it runs the system's default askpass
-// program ($TPMFIDO_ASKPASS_FALLBACK, or OpenSSH's ssh-askpass).
+// program ($KEEPSAKE_ASKPASS_FALLBACK, or OpenSSH's ssh-askpass).
 //
-// tpm-fido-askpass only talks to tpm-fido if the D-Bus name is owned by
-// the tpm-fido binary installed next to it ($TPMFIDO_PATH overrides the
-// path): any program can claim the name while tpm-fido isn't running.
+// keepsake-askpass only talks to Keepsake if the D-Bus name is owned by
+// the Keepsake binary installed next to it ($KEEPSAKE_PATH overrides the
+// path): any program can claim the name while Keepsake isn't running.
 //
 // The main use is gcr-ssh-agent, GNOME's SSH agent: it runs an ssh-agent
 // that asks for security key PINs through SSH_ASKPASS.
@@ -35,20 +35,20 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
-	"github.com/psanford/tpm-fido/src/gnome"
-	"github.com/psanford/tpm-fido/src/ui"
+	"github.com/mkopec/keepsake/src/gnome"
+	"github.com/mkopec/keepsake/src/ui"
 )
 
 const (
 	timeout = 2 * time.Minute
 
-	tpmFidoBusName   = "io.github.psanford.TpmFido"
-	tpmFidoPath      = "/io/github/psanford/TpmFido"
-	tpmFidoInterface = "io.github.psanford.TpmFido.Askpass"
+	keepsakeBusName   = "io.github.mkopec.Keepsake.Daemon"
+	keepsakePath      = "/io/github/mkopec/Keepsake/Daemon"
+	keepsakeInterface = "io.github.mkopec.Keepsake.Daemon.Askpass"
 
 	// how long to wait for the security key request after a "touch"
-	// notification starts, to tell whether tpm-fido handles it
-	tpmFidoWait = time.Second
+	// notification starts, to tell whether Keepsake handles it
+	keepsakeWait = time.Second
 )
 
 var fallbackAskpass = []string{
@@ -82,20 +82,20 @@ func run() int {
 		return notify(ctx, conn, message, start)
 	}
 
-	if owner, ok := genuineTpmFido(conn); kind == "" && strings.Contains(message, "PIN") && ok {
-		pin, err := askTpmFido(ctx, conn, owner, message)
+	if owner, ok := genuineKeepsake(conn); kind == "" && strings.Contains(message, "PIN") && ok {
+		pin, err := askKeepsake(ctx, conn, owner, message)
 		var derr dbus.Error
 		switch {
 		case err == nil:
 			fmt.Println(pin)
 			return 0
-		case errors.As(err, &derr) && (derr.Name == tpmFidoInterface+".Cancelled" || derr.Name == tpmFidoInterface+".Locked"):
+		case errors.As(err, &derr) && (derr.Name == keepsakeInterface+".Cancelled" || derr.Name == keepsakeInterface+".Locked"):
 			return 1
 		case ctx.Err() != nil:
 			return 1
 		}
-		// e.g. tpm-fido is busy with another dialog
-		fmt.Fprintf(os.Stderr, "tpm-fido-askpass: tpm-fido: %s\n", err)
+		// e.g. Keepsake is busy with another dialog
+		fmt.Fprintf(os.Stderr, "keepsake-askpass: Keepsake: %s\n", err)
 	}
 
 	// D-Bus activates gcr-prompter outside GNOME Shell
@@ -108,7 +108,7 @@ func run() int {
 	if kind == "confirm" {
 		ok, err := p.Confirm(ctx, confirmPrompt(message))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "tpm-fido-askpass: %s\n", err)
+			fmt.Fprintf(os.Stderr, "keepsake-askpass: %s\n", err)
 			return 1
 		}
 		if !ok {
@@ -122,7 +122,7 @@ func run() int {
 		return 1
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "tpm-fido-askpass: %s\n", err)
+		fmt.Fprintf(os.Stderr, "keepsake-askpass: %s\n", err)
 		return 1
 	}
 	fmt.Println(secret)
@@ -135,13 +135,13 @@ func hasOwner(conn *dbus.Conn, name string) bool {
 	return err == nil && has
 }
 
-// genuineTpmFido returns the unique bus name of tpm-fido if its well-known
-// name is owned by a process of this user running the expected tpm-fido
+// genuineKeepsake returns the unique bus name of Keepsake if its well-known
+// name is owned by a process of this user running the expected Keepsake
 // binary. Calls must go to the unique name, which can't change owner.
-func genuineTpmFido(conn *dbus.Conn) (string, bool) {
+func genuineKeepsake(conn *dbus.Conn) (string, bool) {
 	bus := conn.BusObject()
 	var owner string
-	if bus.Call("org.freedesktop.DBus.GetNameOwner", 0, tpmFidoBusName).Store(&owner) != nil {
+	if bus.Call("org.freedesktop.DBus.GetNameOwner", 0, keepsakeBusName).Store(&owner) != nil {
 		return "", false
 	}
 	var uid, pid uint32
@@ -156,41 +156,41 @@ func genuineTpmFido(conn *dbus.Conn) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	want := os.Getenv("TPMFIDO_PATH")
+	want := os.Getenv("KEEPSAKE_PATH")
 	if want == "" {
 		self, err := os.Executable()
 		if err != nil {
 			return "", false
 		}
-		want = filepath.Join(filepath.Dir(self), "tpm-fido")
+		want = filepath.Join(filepath.Dir(self), "keepsake")
 	}
 	want, err = filepath.EvalSymlinks(want)
 	if err != nil || exe != want {
-		fmt.Fprintf(os.Stderr, "tpm-fido-askpass: %s is owned by %s, not %s; not using it\n", tpmFidoBusName, exe, want)
+		fmt.Fprintf(os.Stderr, "keepsake-askpass: %s is owned by %s, not %s; not using it\n", keepsakeBusName, exe, want)
 		return "", false
 	}
 	return owner, true
 }
 
-func askTpmFido(ctx context.Context, conn *dbus.Conn, owner, message string) (string, error) {
+func askKeepsake(ctx context.Context, conn *dbus.Conn, owner, message string) (string, error) {
 	var pin string
-	err := conn.Object(owner, tpmFidoPath).
-		CallWithContext(ctx, tpmFidoInterface+".AskPIN", 0, message).Store(&pin)
+	err := conn.Object(owner, keepsakePath).
+		CallWithContext(ctx, keepsakeInterface+".AskPIN", 0, message).Store(&pin)
 	return pin, err
 }
 
-// tpmFidoHandles reports whether tpm-fido received a security key request
-// since start, waiting up to tpmFidoWait for one.
-func tpmFidoHandles(ctx context.Context, conn *dbus.Conn, start time.Time) bool {
-	owner, ok := genuineTpmFido(conn)
+// keepsakeHandles reports whether Keepsake received a security key request
+// since start, waiting up to keepsakeWait for one.
+func keepsakeHandles(ctx context.Context, conn *dbus.Conn, start time.Time) bool {
+	owner, ok := genuineKeepsake(conn)
 	if !ok {
 		return false
 	}
-	obj := conn.Object(owner, tpmFidoPath)
-	deadline := time.Now().Add(tpmFidoWait)
+	obj := conn.Object(owner, keepsakePath)
+	deadline := time.Now().Add(keepsakeWait)
 	for {
 		var age uint64
-		if err := obj.CallWithContext(ctx, tpmFidoInterface+".LastRequestAge", 0).Store(&age); err != nil {
+		if err := obj.CallWithContext(ctx, keepsakeInterface+".LastRequestAge", 0).Store(&age); err != nil {
 			return false
 		}
 		// the agent starts the notification just before the request
@@ -209,9 +209,9 @@ func tpmFidoHandles(ctx context.Context, conn *dbus.Conn, start time.Time) bool 
 }
 
 // notify shows the "touch your security key" notification until ssh kills
-// the program, unless tpm-fido shows its own dialog.
+// the program, unless Keepsake shows its own dialog.
 func notify(ctx context.Context, conn *dbus.Conn, message string, start time.Time) int {
-	if tpmFidoHandles(ctx, conn, start) {
+	if keepsakeHandles(ctx, conn, start) {
 		<-ctx.Done()
 		return 0
 	}
@@ -225,7 +225,7 @@ func notify(ctx context.Context, conn *dbus.Conn, message string, start time.Tim
 		}, int32(0)).Store(&id)
 	if err != nil {
 		if ctx.Err() == nil {
-			fmt.Fprintf(os.Stderr, "tpm-fido-askpass: notification: %s\n", err)
+			fmt.Fprintf(os.Stderr, "keepsake-askpass: notification: %s\n", err)
 		}
 		<-ctx.Done()
 		return 0
@@ -242,7 +242,7 @@ func notify(ctx context.Context, conn *dbus.Conn, message string, start time.Tim
 func fallback(reason string) int {
 	self, _ := os.Executable()
 	candidates := fallbackAskpass
-	if f := os.Getenv("TPMFIDO_ASKPASS_FALLBACK"); f != "" {
+	if f := os.Getenv("KEEPSAKE_ASKPASS_FALLBACK"); f != "" {
 		candidates = []string{f}
 	}
 	for _, c := range candidates {
@@ -253,7 +253,7 @@ func fallback(reason string) int {
 			return 0
 		}
 	}
-	fmt.Fprintf(os.Stderr, "tpm-fido-askpass: %s, and no other askpass program found\n", reason)
+	fmt.Fprintf(os.Stderr, "keepsake-askpass: %s, and no other askpass program found\n", reason)
 	return 1
 }
 

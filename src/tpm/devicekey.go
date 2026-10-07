@@ -105,7 +105,7 @@ func (t *TPM) ensureDeviceKey(tpm transport.TPM) error {
 			want = deviceKeyTemplate(pub.AuthPolicy.Buffer)
 		}
 		if pub.Type != want.Type || pub.NameAlg != want.NameAlg || pub.ObjectAttributes != want.ObjectAttributes {
-			return fmt.Errorf("persistent handle 0x%08x is in use by an object that isn't a tpm-fido device key", t.deviceKeyHandle)
+			return fmt.Errorf("persistent handle 0x%08x is in use by an object that isn't a Keepsake device key", t.deviceKeyHandle)
 		}
 		t.deviceKeyName = rsp.Name
 		t.deviceKeyBound = bound

@@ -1,6 +1,6 @@
 package main
 
-import "github.com/psanford/tpm-fido/src/ctap2"
+import "github.com/mkopec/keepsake/src/ctap2"
 
 // alwaysPIN is a PINStore with a PIN set.
 type alwaysPIN struct{}

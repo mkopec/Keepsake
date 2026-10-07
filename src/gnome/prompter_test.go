@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
-	"github.com/psanford/tpm-fido/src/ui"
+	"github.com/mkopec/keepsake/src/ui"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -74,8 +74,8 @@ func TestSecretExchangeRoundTrip(t *testing.T) {
 // display with xdotool, e.g. scripts/test-gnome-prompter.sh. It drives the
 // dialog with key presses.
 func TestSystemPrompter(t *testing.T) {
-	if os.Getenv("TPMFIDO_PROMPTER_TEST") == "" {
-		t.Skip("set TPMFIDO_PROMPTER_TEST to run against a system prompter")
+	if os.Getenv("KEEPSAKE_PROMPTER_TEST") == "" {
+		t.Skip("set KEEPSAKE_PROMPTER_TEST to run against a system prompter")
 	}
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
@@ -116,7 +116,7 @@ func TestSystemPrompter(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	go answer("Return", os.Getenv("TPMFIDO_SCREENSHOT"))
+	go answer("Return", os.Getenv("KEEPSAKE_SCREENSHOT"))
 	ok, err := p.Confirm(ctx, prompt)
 	if err != nil || !ok {
 		t.Fatalf("confirm: %v %v", ok, err)

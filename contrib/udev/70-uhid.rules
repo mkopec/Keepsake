@@ -1,4 +1,4 @@
 # Let the user logged in at the local desktop create virtual HID devices,
-# so tpm-fido can appear as a USB security key. Must sort before
+# so keepsake can appear as a USB security key. Must sort before
 # 73-seat-late.rules.
 KERNEL=="uhid", SUBSYSTEM=="misc", TAG+="uaccess"

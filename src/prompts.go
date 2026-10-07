@@ -5,7 +5,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/psanford/tpm-fido/src/ui"
+	"github.com/mkopec/keepsake/src/ui"
 )
 
 // The texts of the confirmation dialogs, written for the GNOME Shell system

@@ -8,7 +8,7 @@ import (
 
 	assuan "github.com/foxcpp/go-assuan/client"
 	"github.com/foxcpp/go-assuan/pinentry"
-	"github.com/psanford/tpm-fido/src/ui"
+	"github.com/mkopec/keepsake/src/ui"
 )
 
 func New() *Pinentry {

@@ -2,7 +2,7 @@
 Type=Application
 Name=Security Keys
 Comment=Manage the PIN and passkeys of security keys
-Exec=tpm-fido-settings
+Exec=keepsake-settings
 Icon=dialog-password
 Terminal=false
 Categories=GTK;GNOME;Settings;Security;

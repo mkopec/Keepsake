@@ -9,7 +9,7 @@ import (
 	"github.com/google/go-tpm/tpm2/transport"
 )
 
-// The passkey store records the value of a TPM counter, which tpm-fido
+// The passkey store records the value of a TPM counter, which Keepsake
 // increments whenever it saves the store, so an older copy of the store
 // (e.g. from a backup) isn't accepted: it would bring back deleted, i.e.
 // revoked, passkeys.
@@ -50,7 +50,7 @@ func (t *TPM) storeCounterName(tpm transport.TPM) (tpm2.TPM2BName, bool, error) 
 	written := attrs.Written
 	attrs.Written = false
 	if attrs != want.Attributes || pub.DataSize != want.DataSize {
-		return tpm2.TPM2BName{}, false, fmt.Errorf("NV index 0x%08x exists but is not a tpm-fido store counter", t.storeCounter)
+		return tpm2.TPM2BName{}, false, fmt.Errorf("NV index 0x%08x exists but is not a Keepsake store counter", t.storeCounter)
 	}
 	return rsp.NVName, written, nil
 }

@@ -57,16 +57,16 @@ func (r *recorder) contains(secret []byte) bool {
 // swtpm used for manual testing.
 const testSlot = 60000
 
-// swtpm returns a TPM on the swtpm socket in $TPMFIDO_SWTPM with all traffic
+// swtpm returns a TPM on the swtpm socket in $KEEPSAKE_SWTPM with all traffic
 // recorded, after removing what an earlier run left behind.
 func swtpm(t *testing.T) (*TPM, *recorder, Handles) {
 	return swtpmUser(t, testSlot, filepath.Join(t.TempDir(), "user-secret"))
 }
 
 func swtpmUser(t *testing.T, slot int, secretFile string) (*TPM, *recorder, Handles) {
-	sock := os.Getenv("TPMFIDO_SWTPM")
+	sock := os.Getenv("KEEPSAKE_SWTPM")
 	if sock == "" {
-		t.Skip("set TPMFIDO_SWTPM to an swtpm socket")
+		t.Skip("set KEEPSAKE_SWTPM to an swtpm socket")
 	}
 	h := HandlesForSlot(slot)
 	cleanup := func() {
@@ -291,7 +291,7 @@ func TestSRKPinned(t *testing.T) {
 	if err := os.WriteFile(h.SRKNameFile, []byte("not the SRK"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(os.Getenv("TPMFIDO_SWTPM"), h); !errors.Is(err, ErrSRKMismatch) {
+	if _, err := New(os.Getenv("KEEPSAKE_SWTPM"), h); !errors.Is(err, ErrSRKMismatch) {
 		t.Fatalf("SRK mismatch: %v", err)
 	}
 }
@@ -331,10 +331,10 @@ func TestUsersIsolated(t *testing.T) {
 		t.Fatal("Bob accepts Alice's credential")
 	}
 
-	// tpm-fido refuses to start with Alice's slot and another secret
+	// Keepsake refuses to start with Alice's slot and another secret
 	h := aliceHandles
 	h.UserSecretFile = filepath.Join(t.TempDir(), "mallory")
-	if _, err := New(os.Getenv("TPMFIDO_SWTPM"), h); err == nil {
+	if _, err := New(os.Getenv("KEEPSAKE_SWTPM"), h); err == nil {
 		t.Fatal("started with another user's device key")
 	}
 
@@ -502,7 +502,7 @@ func TestSniffedTemplateCantSign(t *testing.T) {
 }
 
 func TestBootStateBinding(t *testing.T) {
-	sock := os.Getenv("TPMFIDO_SWTPM")
+	sock := os.Getenv("KEEPSAKE_SWTPM")
 	tp, _, h := swtpm(t)
 	// recreate the device key bound to PCR 7
 	tp.bindBootState = true
@@ -541,7 +541,7 @@ func TestBootStateBinding(t *testing.T) {
 		t.Fatalf("sign after boot state change: %v", err)
 	}
 
-	// tpm-fido still starts, so the user can reset
+	// Keepsake still starts, so the user can reset
 	restarted, err := newTPM(sock, h, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -600,7 +600,7 @@ func TestPersistentSRKReused(t *testing.T) {
 	if tp.srkHandle == 0 {
 		t.Fatal("no persistent SRK")
 	}
-	sock := os.Getenv("TPMFIDO_SWTPM")
+	sock := os.Getenv("KEEPSAKE_SWTPM")
 	var n int
 	tp.dial = func() (io.ReadWriteCloser, error) {
 		rwc, err := tpmutil.OpenTPM(sock)

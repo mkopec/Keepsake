@@ -10,7 +10,7 @@ import (
 )
 
 // Session reports whether the user's graphical session is locked, so that
-// tpm-fido can refuse requests that nobody can confirm. It asks:
+// Keepsake can refuse requests that nobody can confirm. It asks:
 //
 //   - logind, for the user's session: locked (LockedHint, set by GNOME and
 //     other desktops) or inactive (another session is in the foreground,

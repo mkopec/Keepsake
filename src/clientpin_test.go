@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psanford/tpm-fido/src/ctap2"
+	"github.com/mkopec/keepsake/src/ctap2"
 )
 
 func TestDecryptNewPIN(t *testing.T) {

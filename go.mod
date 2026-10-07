@@ -1,4 +1,4 @@
-module github.com/psanford/tpm-fido
+module github.com/mkopec/keepsake
 
 go 1.22
 

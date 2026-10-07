@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"math/big"
 
-	"github.com/psanford/tpm-fido/src/tpm"
+	"github.com/mkopec/keepsake/src/tpm"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 

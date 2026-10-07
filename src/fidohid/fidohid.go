@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/psanford/tpm-fido/src/fidoauth"
+	"github.com/mkopec/keepsake/src/fidoauth"
 	"github.com/psanford/uhid"
 )
 

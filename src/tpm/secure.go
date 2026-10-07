@@ -37,14 +37,14 @@ type secure struct {
 }
 
 // Creating the SRK (an ECC primary key) is one of the slowest TPM
-// operations, and tpm-fido needs it several times per request. If the TPM
+// operations, and Keepsake needs it several times per request. If the TPM
 // has a persistent SRK with the same (deterministic) template, it is used
 // instead: at the handles TCG's provisioning guidance and systemd use, or
-// at tpm-fido's own handle, where tpm-fido persists it if neither exists.
+// at Keepsake's own handle, where Keepsake persists it if neither exists.
 // The SRK carries no secrets; it is shared by all users.
 var srkHandles = []uint32{0x81000001, 0x81000002}
 
-const tpmFidoSRKHandle = 0x81310000
+const keepsakeSRKHandle = 0x81310000
 
 // secure loads the SRK and checks it against the pinned name. The caller
 // must call close.
@@ -92,9 +92,9 @@ func (s *secure) close() {
 }
 
 // findPersistentSRK looks for a persistent SRK with the pinned name, and
-// persists sec's SRK at tpm-fido's handle if there is none.
+// persists sec's SRK at Keepsake's handle if there is none.
 func (t *TPM) findPersistentSRK(tpm transport.TPM, sec *secure) {
-	for _, h := range append(srkHandles, tpmFidoSRKHandle) {
+	for _, h := range append(srkHandles, keepsakeSRKHandle) {
 		rsp, err := tpm2.ReadPublic{ObjectHandle: tpm2.TPMHandle(h)}.Execute(tpm)
 		if err != nil {
 			continue
@@ -114,10 +114,10 @@ func (t *TPM) findPersistentSRK(tpm transport.TPM, sec *secure) {
 	_, err := tpm2.EvictControl{
 		Auth:             ownerAuth,
 		ObjectHandle:     tpm2.NamedHandle{Handle: sec.srk.ObjectHandle, Name: sec.srk.Name},
-		PersistentHandle: tpm2.TPMIDHPersistent(tpmFidoSRKHandle),
+		PersistentHandle: tpm2.TPMIDHPersistent(keepsakeSRKHandle),
 	}.Execute(tpm)
 	if err == nil {
-		t.srkHandle = tpmFidoSRKHandle
+		t.srkHandle = keepsakeSRKHandle
 	}
 }
 
@@ -172,7 +172,7 @@ func (t *TPM) pinSRK(tpm transport.TPM, path string) error {
 		return err
 	}
 	if !bytes.Equal(pinned, name.Buffer) {
-		return fmt.Errorf("%w: either the TPM was cleared, which also destroyed all tpm-fido credentials, "+
+		return fmt.Errorf("%w: either the TPM was cleared, which also destroyed all Keepsake credentials, "+
 			"or something between the CPU and the TPM is intercepting its traffic. If you cleared the TPM, "+
 			"delete %s", ErrSRKMismatch, path)
 	}

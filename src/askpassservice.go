@@ -13,18 +13,18 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
-	"github.com/psanford/tpm-fido/src/ui"
+	"github.com/mkopec/keepsake/src/ui"
 )
 
 // SSH agents ask for the PIN of verify-required security keys with
-// SSH_ASKPASS, and tpm-fido then asks the user to confirm the signature:
-// two dialogs. tpm-fido-askpass instead asks tpm-fido for the PIN over
-// D-Bus, and tpm-fido shows a single prompt. Typing the PIN into a prompt
-// tpm-fido showed proves that the user is present, so tpm-fido grants
+// SSH_ASKPASS, and Keepsake then asks the user to confirm the signature:
+// two dialogs. keepsake-askpass instead asks Keepsake for the PIN over
+// D-Bus, and Keepsake shows a single prompt. Typing the PIN into a prompt
+// Keepsake showed proves that the user is present, so Keepsake grants
 // presence once: the next GetAssertion whose verified PIN is the one typed,
 // within presenceGrantTTL, doesn't show the confirmation dialog.
 //
-// Any program on the session bus can ask tpm-fido to show the prompt, but
+// Any program on the session bus can ask Keepsake to show the prompt, but
 // it can't answer it for the user. It could ask for the PIN this way and
 // receive it, but it could equally show its own (or the system prompter's)
 // PIN prompt. A program that already knows the PIN and races the user's
@@ -34,9 +34,9 @@ import (
 // requests (relying party IDs starting with "ssh:"): a program can't use
 // the prompt to have the user unknowingly confirm a sign in to a website.
 const (
-	askpassBusName   = "io.github.psanford.TpmFido"
-	askpassPath      = "/io/github/psanford/TpmFido"
-	askpassInterface = "io.github.psanford.TpmFido.Askpass"
+	askpassBusName   = "io.github.mkopec.Keepsake.Daemon"
+	askpassPath      = "/io/github/mkopec/Keepsake/Daemon"
+	askpassInterface = "io.github.mkopec.Keepsake.Daemon.Askpass"
 
 	presenceGrantTTL = 15 * time.Second
 	askPINTimeout    = 2 * time.Minute
@@ -44,9 +44,9 @@ const (
 
 // AskPIN doesn't return the PIN the user typed: any program on the session
 // bus can call it, and must not learn the PIN. It returns a random one-time
-// token instead, which the SSH agent sends to tpm-fido as if it were the
+// token instead, which the SSH agent sends to Keepsake as if it were the
 // PIN. getPinToken recognizes the token's hash and verifies the real PIN,
-// which never leaves tpm-fido, against the TPM. The pinToken issued that way
+// which never leaves Keepsake, against the TPM. The pinToken issued that way
 // is only valid for SSH, so a program that calls AskPIN and gets the user to
 // type their PIN gains at most one SSH signature.
 type presenceGrant struct {
@@ -122,7 +122,7 @@ func (a askpassService) AskPIN(message string) (string, *dbus.Error) {
 	return token, nil
 }
 
-// LastRequestAge returns the milliseconds since tpm-fido last received a
+// LastRequestAge returns the milliseconds since Keepsake last received a
 // request that may need confirmation, or the maximum value if it never did.
 func (a askpassService) LastRequestAge() (uint64, *dbus.Error) {
 	last := a.s.lastRequest.Load()
@@ -142,7 +142,7 @@ func (s *server) exportAskpassService(conn *dbus.Conn) error {
 		return err
 	}
 	if reply != dbus.RequestNameReplyPrimaryOwner {
-		return fmt.Errorf("%s is already owned, another tpm-fido is running", askpassBusName)
+		return fmt.Errorf("%s is already owned, another Keepsake is running", askpassBusName)
 	}
 	return nil
 }
@@ -152,7 +152,7 @@ func (s *server) noteRequest() {
 }
 
 // usePresenceGrant reports whether the presence of the user was proven by
-// typing the PIN of this user verified SSH request into tpm-fido's prompt.
+// typing the PIN of this user verified SSH request into Keepsake's prompt.
 func (s *server) usePresenceGrant(uv bool, rpID string) bool {
 	if !uv || !strings.HasPrefix(rpID, "ssh:") || !s.grant.consume(s.pin.pinHash) {
 		return false

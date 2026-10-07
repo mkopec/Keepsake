@@ -15,7 +15,7 @@ import (
 )
 
 // Every member of the tss group can use the TPM directly, so on a machine
-// with several tpm-fido users each user's TPM objects must be useless to the
+// with several Keepsake users each user's TPM objects must be useless to the
 // others. Each user has
 //
 //   - their own handles, derived from a slot number (by default the UID),

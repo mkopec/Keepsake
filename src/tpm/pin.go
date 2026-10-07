@@ -29,7 +29,7 @@ const (
 // The PIN index's authValue is the PIN hash. The owner can read and write
 // its data; reading the index with its own authValue proves knowledge of
 // the PIN. NoDA is clear so wrong PINs count towards the TPM's dictionary
-// attack lockout, which limits guessing even when bypassing tpm-fido.
+// attack lockout, which limits guessing even when bypassing keepsake.
 func pinNVPublic(index uint32) tpm2.TPMSNVPublic {
 	return tpm2.TPMSNVPublic{
 		NVIndex: tpm2.TPMIRHNVIndex(index),
@@ -70,7 +70,7 @@ func (t *TPM) pinIndex(tpm transport.TPM) (name tpm2.TPM2BName, exists, written 
 	written = attrs.Written
 	attrs.Written = false
 	if attrs != want.Attributes || pub.DataSize != want.DataSize || pub.NameAlg != want.NameAlg {
-		return name, false, false, fmt.Errorf("NV index 0x%08x exists but is not a tpm-fido PIN index", t.pinIndexHandle)
+		return name, false, false, fmt.Errorf("NV index 0x%08x exists but is not a Keepsake PIN index", t.pinIndexHandle)
 	}
 
 	return rsp.NVName, true, written, nil

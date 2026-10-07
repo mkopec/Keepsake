@@ -1,13 +1,13 @@
 [Unit]
 Description=TPM backed FIDO2 security key
-Documentation=https://github.com/psanford/tpm-fido
+Documentation=https://github.com/mkopec/keepsake
 # Run only while a graphical session is up: nobody can confirm requests
 # without one.
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-ExecStart=%h/.local/bin/tpm-fido
+ExecStart=%h/.local/bin/keepsake
 Restart=on-failure
 RestartSec=5s
 

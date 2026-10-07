@@ -8,7 +8,7 @@ import (
 )
 
 // Any program that can open the device (or use the session bus) can make
-// tpm-fido show dialogs. dialogLimiter refuses requests that would show
+// Keepsake show dialogs. dialogLimiter refuses requests that would show
 // more than dialogBurst dialogs within dialogWindow, so such a program
 // can't flood the screen (or make the user click through out of
 // annoyance).

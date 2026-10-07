@@ -11,7 +11,7 @@ import (
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
-	"github.com/psanford/tpm-fido/src/internal/lencode"
+	"github.com/mkopec/keepsake/src/internal/lencode"
 	"golang.org/x/crypto/cryptobyte"
 	"golang.org/x/crypto/cryptobyte/asn1"
 	"golang.org/x/crypto/hkdf"
@@ -46,7 +46,7 @@ const (
 	// with the device key, sent to the TPM encrypted and only used in
 	// HMAC sessions. Without it, someone who recorded the bus of a
 	// discrete TPM (which shows the primary key template) could use a
-	// credential key without tpm-fido, even after a reset. Format 0x20
+	// credential key without Keepsake, even after a reset. Format 0x20
 	// keys don't have one; they are still accepted.
 	keyHandleFormat     = 0x30
 	keyHandleFormatV2   = 0x20

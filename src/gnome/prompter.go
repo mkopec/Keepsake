@@ -1,4 +1,4 @@
-// gnome integrates tpm-fido with the GNOME desktop: confirmation dialogs
+// gnome integrates Keepsake with the GNOME desktop: confirmation dialogs
 // through the GNOME Shell system prompter and screen lock detection.
 package gnome
 
@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
-	"github.com/psanford/tpm-fido/src/ui"
+	"github.com/mkopec/keepsake/src/ui"
 )
 
 // The system prompter protocol is gcr's internal D-Bus interface
@@ -25,7 +25,7 @@ const (
 	prompterPath       = "/org/gnome/keyring/Prompter"
 	prompterInterface  = "org.gnome.keyring.internal.Prompter"
 	callbackInterface  = "org.gnome.keyring.internal.Prompter.Callback"
-	callbackPathPrefix = "/org/gnome/keyring/Prompt/tpmfido"
+	callbackPathPrefix = "/org/gnome/keyring/Prompt/keepsake"
 )
 
 // SystemPrompterAvailable reports whether a system prompter currently owns

@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/psanford/tpm-fido/src/ctap2"
-	"github.com/psanford/tpm-fido/src/tpm"
+	"github.com/mkopec/keepsake/src/ctap2"
+	"github.com/mkopec/keepsake/src/tpm"
 )
 
 // hmacSecretCreate reports whether a MakeCredential request asks for the

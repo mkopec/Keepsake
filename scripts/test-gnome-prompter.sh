@@ -4,7 +4,7 @@
 # gcr (gcr-prompter).
 set -e
 cd "$(dirname "$0")/.."
-export TPMFIDO_PROMPTER_TEST=1
+export KEEPSAKE_PROMPTER_TEST=1
 unset WAYLAND_DISPLAY
 export GDK_BACKEND=x11
 exec xvfb-run -a -s "-screen 0 1024x768x24" \

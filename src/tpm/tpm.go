@@ -29,7 +29,7 @@ const nvTypeCounter tpm2.NVAttr = 0x10
 const counterAttrs = nvTypeCounter | tpm2.AttrAuthWrite | tpm2.AttrAuthRead |
 	tpm2.AttrNoDA | tpm2.AttrOrderly
 
-// Handles are the TPM NV indices and persistent handles used by tpm-fido.
+// Handles are the TPM NV indices and persistent handles used by keepsake.
 type Handles struct {
 	CounterIndex uint32
 	PINIndex     uint32
@@ -177,7 +177,7 @@ func (t *TPM) ensureCounter(tpm io.ReadWriter) error {
 	pub, err := tpm2.NVReadPublic(tpm, t.counterIndex)
 	if err == nil {
 		if pub.Attributes&^tpm2.AttrWritten != counterAttrs || pub.DataSize != 8 {
-			return fmt.Errorf("NV index 0x%08x exists but is not a tpm-fido counter (attributes %s)", t.counterIndex, pub.Attributes)
+			return fmt.Errorf("NV index 0x%08x exists but is not a Keepsake counter (attributes %s)", t.counterIndex, pub.Attributes)
 		}
 		return nil
 	}

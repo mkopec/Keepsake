@@ -18,16 +18,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/psanford/tpm-fido/src/attestation"
-	"github.com/psanford/tpm-fido/src/ctap2"
-	"github.com/psanford/tpm-fido/src/fidoauth"
-	"github.com/psanford/tpm-fido/src/fidohid"
-	"github.com/psanford/tpm-fido/src/memory"
-	"github.com/psanford/tpm-fido/src/passkeys"
-	"github.com/psanford/tpm-fido/src/sitesignatures"
-	"github.com/psanford/tpm-fido/src/statuscode"
-	"github.com/psanford/tpm-fido/src/tpm"
-	"github.com/psanford/tpm-fido/src/ui"
+	"github.com/mkopec/keepsake/src/attestation"
+	"github.com/mkopec/keepsake/src/ctap2"
+	"github.com/mkopec/keepsake/src/fidoauth"
+	"github.com/mkopec/keepsake/src/fidohid"
+	"github.com/mkopec/keepsake/src/memory"
+	"github.com/mkopec/keepsake/src/passkeys"
+	"github.com/mkopec/keepsake/src/sitesignatures"
+	"github.com/mkopec/keepsake/src/statuscode"
+	"github.com/mkopec/keepsake/src/tpm"
+	"github.com/mkopec/keepsake/src/ui"
 )
 
 var backend = flag.String("backend", "tpm", "tpm|memory")
@@ -36,7 +36,7 @@ var slot = flag.Int("slot", -1, "TPM handle slot (0-65535), default: the user ID
 var bindBootState = flag.Bool("bind-boot-state", false, "bind credentials created after the next reset to the boot state (PCR 7, the Secure Boot configuration); see docs/security.md")
 var allowSilent = flag.Bool("allow-silent", false, "allow hmac-secret outputs and U2F signatures without user presence (e.g. LUKS enrolled with --fido2-with-user-presence=no)")
 var verbose = flag.Bool("verbose", false, "log relying party IDs and user names")
-var passkeyStore = flag.String("passkey-store", "", "passkey store path (default $XDG_DATA_HOME/tpm-fido/passkeys)")
+var passkeyStore = flag.String("passkey-store", "", "passkey store path (default $XDG_DATA_HOME/keepsake/passkeys)")
 
 func main() {
 	flag.Parse()
@@ -103,7 +103,7 @@ func newServer() *server {
 	path := *passkeyStore
 	if path == "" && *backend == "memory" {
 		// the memory backend's keys don't outlive the process
-		dir, err := os.MkdirTemp("", "tpm-fido-memory-")
+		dir, err := os.MkdirTemp("", "keepsake-memory-")
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -112,6 +112,13 @@ func newServer() *server {
 		var err error
 		if path, err = passkeys.DefaultPath(); err != nil {
 			log.Fatal(err)
+		}
+		moved, err := passkeys.MigrateDataDir(path)
+		if err != nil {
+			log.Fatalf("moving ~/.local/share/tpm-fido to %s: %s", filepath.Dir(path), err)
+		}
+		if moved {
+			log.Printf("moved the data directory of tpm-fido to %s", filepath.Dir(path))
 		}
 	}
 
@@ -143,7 +150,7 @@ func newServer() *server {
 			log.Printf("credentials are bound to the boot state (PCR 7)")
 		}
 		if old := signer.LeftoverSharedObjects(); len(old) > 0 {
-			log.Printf("note: TPM objects from an earlier tpm-fido development version are left at %#x; "+
+			log.Printf("note: TPM objects from an earlier Keepsake development version are left at %#x; "+
 				"their credentials don't work anymore. If no other user still runs that version, remove them "+
 				"with tpm2_nvundefine -C o <index> and tpm2_evictcontrol -C o -c <handle>", old)
 		}
@@ -192,7 +199,7 @@ func warnLockout(t *tpm.TPM) {
 func (s *server) run() {
 	ctx := context.Background()
 
-	token, err := fidohid.New(ctx, "tpm-fido")
+	token, err := fidohid.New(ctx, "Keepsake")
 	if err != nil {
 		if errors.Is(err, fs.ErrPermission) {
 			log.Fatalf("create fido hid error: %s: your user needs read and write access to /dev/uhid, see docs/installing.md", err)

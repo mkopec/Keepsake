@@ -178,3 +178,24 @@ func TestUnversionedMigration(t *testing.T) {
 		t.Fatalf("migration load: %v %v", creds, err)
 	}
 }
+
+func TestMigrateDataDir(t *testing.T) {
+	base := t.TempDir()
+	path := filepath.Join(base, "keepsake", "passkeys")
+	if moved, err := MigrateDataDir(path); moved || err != nil {
+		t.Fatalf("nothing to migrate: %v %v", moved, err)
+	}
+	os.MkdirAll(filepath.Join(base, "tpm-fido"), 0700)
+	os.WriteFile(filepath.Join(base, "tpm-fido", "user-secret"), []byte("s"), 0600)
+	if moved, err := MigrateDataDir(path); !moved || err != nil {
+		t.Fatalf("migrate: %v %v", moved, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(base, "keepsake", "user-secret")); string(b) != "s" {
+		t.Fatal("user secret not moved")
+	}
+	// an existing new directory is never replaced
+	os.MkdirAll(filepath.Join(base, "tpm-fido"), 0700)
+	if moved, _ := MigrateDataDir(path); moved {
+		t.Fatal("replaced the existing directory")
+	}
+}

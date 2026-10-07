@@ -10,14 +10,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/psanford/tpm-fido/src/ctap2"
-	"github.com/psanford/tpm-fido/src/fidohid"
-	"github.com/psanford/tpm-fido/src/passkeys"
-	"github.com/psanford/tpm-fido/src/tpm"
-	"github.com/psanford/tpm-fido/src/ui"
+	"github.com/mkopec/keepsake/src/ctap2"
+	"github.com/mkopec/keepsake/src/fidohid"
+	"github.com/mkopec/keepsake/src/passkeys"
+	"github.com/mkopec/keepsake/src/tpm"
+	"github.com/mkopec/keepsake/src/ui"
 )
 
-// aaguid identifies the tpm-fido authenticator model:
+// aaguid identifies the Keepsake authenticator model:
 // 5a578a82-5a81-402a-a89a-bb6e12f90eff
 var aaguid = []byte{0x5a, 0x57, 0x8a, 0x82, 0x5a, 0x81, 0x40, 0x2a, 0xa8, 0x9a, 0xbb, 0x6e, 0x12, 0xf9, 0x0e, 0xff}
 
@@ -307,7 +307,7 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 	}
 	// Without user presence, anyone who can open the device and knows the
 	// credential ID (which isn't secret, e.g. it is in the LUKS header)
-	// could get the secret, as long as tpm-fido runs.
+	// could get the secret, as long as Keepsake runs.
 	if hmacReq != nil && !up && !*allowSilent {
 		log.Print("hmac-secret without user presence refused (see -allow-silent)")
 		hmacReq = nil

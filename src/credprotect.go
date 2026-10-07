@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/psanford/tpm-fido/src/ctap2"
+	"github.com/mkopec/keepsake/src/ctap2"
 )
 
 // credProtect (CTAP 2.1 section 12.1) lets a relying party restrict when a
@@ -11,7 +11,7 @@ import (
 //  2. userVerificationOptionalWithCredentialIDList: a discoverable
 //     credential isn't discovered without user verification, only used when
 //     the platform names it in the allowList
-//  3. userVerificationRequired: only with user verification. tpm-fido binds
+//  3. userVerificationRequired: only with user verification. Keepsake binds
 //     the credential key to the PIN in the TPM, so even software that uses
 //     the TPM directly can't sign with it without the PIN.
 

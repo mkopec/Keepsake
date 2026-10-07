@@ -5,8 +5,8 @@ import (
 	"crypto/sha256"
 	"log"
 
-	"github.com/psanford/tpm-fido/src/ctap2"
-	"github.com/psanford/tpm-fido/src/passkeys"
+	"github.com/mkopec/keepsake/src/ctap2"
+	"github.com/mkopec/keepsake/src/passkeys"
 )
 
 // credMgmtState holds the remaining items of an enumeration.
