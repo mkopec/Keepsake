@@ -78,9 +78,10 @@ class Window(Adw.ApplicationWindow):
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
         header = Adw.HeaderBar()
-        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh")
-        refresh.connect("clicked", lambda *_: self.reload())
-        header.pack_start(refresh)
+        self.refresh_button = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh")
+        self.refresh_button.connect("clicked", lambda *_: self.reload())
+        header.pack_start(self.refresh_button)
+        self.busy_count = 0
         view.add_top_bar(header)
         self.stack = Gtk.Stack()
         view.set_content(self.stack)
@@ -95,25 +96,37 @@ class Window(Adw.ApplicationWindow):
         return toast
 
     def busy(self, busy):
-        self.stack.set_sensitive(not busy)
+        """Disables the window while an operation runs: two operations at
+        once would talk to the same security key over different channels and
+        get in each other's way."""
+        self.busy_count += 1 if busy else -1
+        idle = self.busy_count == 0
+        self.stack.set_sensitive(idle)
+        self.refresh_button.set_sensitive(idle)
 
     # loading
 
     def reload(self):
+        if self.busy_count:
+            return
         self.busy(True)
         run_in_thread(list_keys, self._loaded)
 
-    def _loaded(self, keys, error):
+    def _loaded(self, result, error):
         self.busy(False)
-        self.keys = keys or []
+        keys, errors = result if result else ([], [])
+        # close the connections of the previous list
+        for k in self.keys:
+            k.close()
+        self.keys = keys
         if self.key is None or self.key.path not in [k.path for k in self.keys]:
             self.key = self.keys[0] if self.keys else None
             self.pin = None
             self.passkeys = None
         else:
             self.key = next(k for k in self.keys if k.path == self.key.path)
-        if error:
-            self.toast(error)
+        for e in ([error] if error else []) + errors:
+            self.toast(e)
         self.render()
 
     def select_key(self, index):

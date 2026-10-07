@@ -2,13 +2,15 @@
 commands through python-fido2, so they work with Keepsake and with hardware
 security keys."""
 
+import random
+import time
 from dataclasses import dataclass
 
 from fido2.ctap import CtapError
 from fido2.ctap2 import Ctap2
 from fido2.ctap2.credman import CredentialManagement
 from fido2.ctap2.pin import ClientPin
-from fido2.hid import CtapHidDevice
+from fido2.hid import CAPABILITY, ConnectionFailure, CtapHidDevice, list_descriptors, open_connection
 
 KEEPSAKE_VID, KEEPSAKE_PID = 0x15D9, 0x0A37
 
@@ -150,14 +152,50 @@ class SecurityKey:
             raise SecurityKeyError(describe_error(e, retries)) from e
 
 
-def list_keys() -> list[SecurityKey]:
-    keys = []
-    for dev in CtapHidDevice.list_devices():
+    def close(self):
+        self.dev.close()
+
+
+def _transient(e: Exception) -> bool:
+    """Reports whether e is caused by another program (or another channel of
+    this one) using the key at the same time. Every program that opens a key
+    sees all of its responses, so a busy key can also show up as a response
+    for the wrong channel or nonce."""
+    return isinstance(e, ConnectionFailure) or (isinstance(e, CtapError) and e.code == ERR.CHANNEL_BUSY)
+
+
+def _open(descriptor, attempts=6) -> SecurityKey | None:
+    """Opens a CTAP2 key, retrying while it is busy. Returns None for
+    U2F-only keys, which have no PIN or passkeys to manage."""
+    for i in range(attempts):
+        conn = open_connection(descriptor)
         try:
-            keys.append(SecurityKey(dev))
-        except Exception:
-            # U2F-only keys don't support CTAP2
+            dev = CtapHidDevice(descriptor, conn)
+            if not dev.capabilities & CAPABILITY.CBOR:
+                conn.close()
+                return None
+            return SecurityKey(dev)
+        except Exception as e:
+            conn.close()
+            if not _transient(e) or i == attempts - 1:
+                raise
+            # random backoff, so programs retrying together don't collide
+            # again
+            time.sleep(random.uniform(0.05, 0.15) * (i + 1))
+
+
+def list_keys() -> tuple[list[SecurityKey], list[str]]:
+    """Returns the CTAP2 security keys, and messages about keys that couldn't
+    be read."""
+    keys, errors = [], []
+    for d in list_descriptors():
+        try:
+            key = _open(d)
+        except Exception as e:
+            errors.append(f"Couldn’t read {d.product_name or 'a security key'}: {e}")
             continue
+        if key is not None:
+            keys.append(key)
     # Keepsake first
     keys.sort(key=lambda k: not k.is_keepsake)
-    return keys
+    return keys, errors
