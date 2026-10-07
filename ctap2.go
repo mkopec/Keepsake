@@ -58,8 +58,9 @@ func (s *server) dispatchCBOR(evt fidohid.AuthEvent, ka *keepalive) (interface{}
 			return nil, err
 		}
 		return ctap2.GetInfoResp{
-			Versions: []string{"U2F_V2", "FIDO_2_0"},
-			AAGUID:   aaguid,
+			Versions:   []string{"U2F_V2", "FIDO_2_0"},
+			Extensions: []string{ctap2.ExtHMACSecret},
+			AAGUID:     aaguid,
 			Options: map[string]bool{
 				"rk":        false,
 				"up":        true,
@@ -128,6 +129,11 @@ func (s *server) makeCredential(evt fidohid.AuthEvent, ka *keepalive, req *ctap2
 		return nil, err
 	}
 
+	hmacSecret, err := hmacSecretCreate(req.Extensions)
+	if err != nil {
+		return nil, err
+	}
+
 	// CTAP 2.0 requires the PIN for every registration once it is set.
 	uv, err := s.checkPINUVAuth(req.PinUvAuthParam, req.PinUvAuthProtocol, req.ClientDataHash, true)
 	if err != nil {
@@ -153,7 +159,7 @@ func (s *server) makeCredential(evt fidohid.AuthEvent, ka *keepalive, req *ctap2
 		return nil, err
 	}
 
-	credID, x, y, err := s.signer.RegisterKey(rpIDHash[:])
+	credID, x, y, err := s.signer.RegisterKey(rpIDHash[:], hmacSecret)
 	if err != nil {
 		return nil, fmt.Errorf("register key err: %w", err)
 	}
@@ -170,8 +176,15 @@ func (s *server) makeCredential(evt fidohid.AuthEvent, ka *keepalive, req *ctap2
 	if uv {
 		flags |= ctap2.FlagUserVerified
 	}
+	var extensions []byte
+	if hmacSecret {
+		if extensions, err = ctap2.Marshal(map[string]bool{ctap2.ExtHMACSecret: true}); err != nil {
+			return nil, err
+		}
+	}
+
 	attested := ctap2.AttestedCredentialData(aaguid, credID, coseKey)
-	authData := ctap2.AuthenticatorData(rpIDHash[:], flags, counter, attested)
+	authData := ctap2.AuthenticatorData(rpIDHash[:], flags, counter, attested, extensions)
 
 	sig, err := s.signer.SignASN1(credID, rpIDHash[:], signedDigest(authData, req.ClientDataHash))
 	if err != nil {
@@ -214,6 +227,11 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 		return nil, err
 	}
 
+	hmacReq, err := s.parseHMACSecretGet(req.Extensions)
+	if err != nil {
+		return nil, err
+	}
+
 	rpIDHash := sha256.Sum256([]byte(req.RPID))
 
 	// Without discoverable credentials an empty allowList can never match.
@@ -239,11 +257,18 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 		flags |= ctap2.FlagUserVerified
 	}
 
+	var extensions []byte
+	if hmacReq != nil {
+		if extensions, err = s.hmacSecretOutput(hmacReq, credID, rpIDHash[:], uv); err != nil {
+			return nil, err
+		}
+	}
+
 	counter, err := s.signer.Counter()
 	if err != nil {
 		return nil, fmt.Errorf("counter err: %w", err)
 	}
-	authData := ctap2.AuthenticatorData(rpIDHash[:], flags, counter, nil)
+	authData := ctap2.AuthenticatorData(rpIDHash[:], flags, counter, nil, extensions)
 
 	sig, err := s.signer.SignASN1(credID, rpIDHash[:], signedDigest(authData, req.ClientDataHash))
 	if err != nil {

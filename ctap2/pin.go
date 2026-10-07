@@ -197,3 +197,15 @@ func cbcDecrypt(key, iv, ciphertext []byte) []byte {
 	cipher.NewCBCDecrypter(block, iv).CryptBlocks(out, ciphertext)
 	return out
 }
+
+// ExtHMACSecret is the identifier of the hmac-secret extension.
+const ExtHMACSecret = "hmac-secret"
+
+// HMACSecretInput is the hmac-secret extension input of GetAssertion.
+type HMACSecretInput struct {
+	KeyAgreement *COSEKey `cbor:"1,keyasint"`
+	SaltEnc      []byte   `cbor:"2,keyasint"`
+	SaltAuth     []byte   `cbor:"3,keyasint"`
+	// added in CTAP 2.1; defaults to 1
+	PinUvAuthProtocol uint `cbor:"4,keyasint"`
+}

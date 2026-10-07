@@ -43,9 +43,12 @@ type server struct {
 }
 
 type Signer interface {
-	RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, error)
+	RegisterKey(applicationParam []byte, hmacSecret bool) ([]byte, *big.Int, *big.Int, error)
 	SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, error)
 	Counter() (uint32, error)
+	// HMACSecret returns the hmac-secret CredRandom of a credential, the
+	// one used with user verification if uvPinHash is set.
+	HMACSecret(keyHandle, rpIDHash, uvPinHash []byte) ([]byte, error)
 }
 
 func newServer() *server {
@@ -295,7 +298,7 @@ func (s *server) handleRegister(parentCtx context.Context, token *fidohid.SoftTo
 func (s *server) registerSite(ctx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent) {
 	req := evt.Req
 
-	keyHandle, x, y, err := s.signer.RegisterKey(req.Register.ApplicationParam[:])
+	keyHandle, x, y, err := s.signer.RegisterKey(req.Register.ApplicationParam[:], false)
 	if err != nil {
 		log.Printf("RegisteKey err: %s", err)
 		return

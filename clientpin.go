@@ -24,7 +24,9 @@ const (
 // PINStore persists the clientPIN state. pinHash is LEFT(SHA-256(PIN), 16).
 type PINStore interface {
 	PINSet() (bool, error)
-	SetPIN(pinHash []byte, retries int) error
+	// SetPIN stores a new PIN. oldPinHash is the current PIN hash when
+	// changing the PIN and nil otherwise.
+	SetPIN(pinHash, oldPinHash []byte, retries int) error
 	PINRetries() (int, error)
 	SetPINRetries(retries int) error
 	// VerifyPIN returns tpm.ErrLockout if the PIN can't be checked right now.
@@ -34,8 +36,11 @@ type PINStore interface {
 // pinState is the volatile clientPIN state, reset when tpm-fido restarts
 // (the equivalent of an authenticator power cycle).
 type pinState struct {
-	keyAgreement        *ecdh.PrivateKey
-	pinToken            []byte
+	keyAgreement *ecdh.PrivateKey
+	pinToken     []byte
+	// pinHash is the hash of the PIN that pinToken was issued for. It is
+	// needed to use the TPM's UV key for hmac-secret.
+	pinHash             []byte
 	consecutiveFailures int
 }
 
@@ -56,6 +61,7 @@ func (ps *pinState) regenerateKeyAgreement() {
 
 func (ps *pinState) regeneratePINToken() {
 	ps.pinToken = mustRand(32)
+	ps.pinHash = nil
 }
 
 func (s *server) clientPIN(req *ctap2.ClientPINReq) (interface{}, error) {
@@ -136,7 +142,7 @@ func (s *server) setPIN(proto ctap2.PINProtocol, req *ctap2.ClientPINReq) error 
 		return err
 	}
 
-	if err := s.pins.SetPIN(pinHash, maxPINRetries); err != nil {
+	if err := s.pins.SetPIN(pinHash, nil, maxPINRetries); err != nil {
 		return err
 	}
 	s.pin.regeneratePINToken()
@@ -164,7 +170,8 @@ func (s *server) changePIN(proto ctap2.PINProtocol, req *ctap2.ClientPINReq) err
 	if !ctap2.VerifyPINAuth(proto, shared, msg, req.PinAuth) {
 		return ctap2.ErrPinAuthInvalid
 	}
-	if err := s.verifyPINHash(proto, shared, req.PinHashEnc); err != nil {
+	oldPinHash, err := s.verifyPINHash(proto, shared, req.PinHashEnc)
+	if err != nil {
 		return err
 	}
 	pinHash, err := decryptNewPIN(proto, shared, req.NewPinEnc)
@@ -172,7 +179,7 @@ func (s *server) changePIN(proto ctap2.PINProtocol, req *ctap2.ClientPINReq) err
 		return err
 	}
 
-	if err := s.pins.SetPIN(pinHash, maxPINRetries); err != nil {
+	if err := s.pins.SetPIN(pinHash, oldPinHash, maxPINRetries); err != nil {
 		return err
 	}
 	s.pin.regeneratePINToken()
@@ -196,40 +203,42 @@ func (s *server) getPINToken(proto ctap2.PINProtocol, req *ctap2.ClientPINReq) (
 	if err != nil {
 		return nil, err
 	}
-	if err := s.verifyPINHash(proto, shared, req.PinHashEnc); err != nil {
+	pinHash, err := s.verifyPINHash(proto, shared, req.PinHashEnc)
+	if err != nil {
 		return nil, err
 	}
 
 	s.pin.regeneratePINToken()
+	s.pin.pinHash = pinHash
 	return ctap2.ClientPINResp{PinToken: proto.Encrypt(shared, s.pin.pinToken)}, nil
 }
 
 // verifyPINHash checks the encrypted PIN hash sent by the platform against
-// the stored PIN, maintaining the retry counters.
-func (s *server) verifyPINHash(proto ctap2.PINProtocol, shared, pinHashEnc []byte) error {
+// the stored PIN, maintaining the retry counters. It returns the PIN hash.
+func (s *server) verifyPINHash(proto ctap2.PINProtocol, shared, pinHashEnc []byte) ([]byte, error) {
 	retries, err := s.pins.PINRetries()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if retries <= 0 {
-		return ctap2.ErrPinBlocked
+		return nil, ctap2.ErrPinBlocked
 	}
 	if s.pin.consecutiveFailures >= maxConsecutivePINFailures {
-		return ctap2.ErrPinAuthBlocked
+		return nil, ctap2.ErrPinAuthBlocked
 	}
 
 	pinHash, err := proto.Decrypt(shared, pinHashEnc)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(pinHash) != 16 {
-		return ctap2.ErrInvalidParameter
+		return nil, ctap2.ErrInvalidParameter
 	}
 
 	// Count the attempt before checking it, so that cutting power (killing
 	// tpm-fido) after a wrong guess doesn't save a retry.
 	if err := s.pins.SetPINRetries(retries - 1); err != nil {
-		return err
+		return nil, err
 	}
 
 	ok, err := s.pins.VerifyPIN(pinHash)
@@ -237,12 +246,12 @@ func (s *server) verifyPINHash(proto ctap2.PINProtocol, shared, pinHashEnc []byt
 		// The TPM didn't check the PIN, so don't count the attempt.
 		log.Printf("PIN check refused: %s", err)
 		if err := s.pins.SetPINRetries(retries); err != nil {
-			return err
+			return nil, err
 		}
-		return ctap2.ErrPinAuthBlocked
+		return nil, ctap2.ErrPinAuthBlocked
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if !ok {
@@ -251,15 +260,18 @@ func (s *server) verifyPINHash(proto ctap2.PINProtocol, shared, pinHashEnc []byt
 		log.Printf("wrong PIN, %d retries left", retries-1)
 		switch {
 		case retries-1 <= 0:
-			return ctap2.ErrPinBlocked
+			return nil, ctap2.ErrPinBlocked
 		case s.pin.consecutiveFailures >= maxConsecutivePINFailures:
-			return ctap2.ErrPinAuthBlocked
+			return nil, ctap2.ErrPinAuthBlocked
 		}
-		return ctap2.ErrPinInvalid
+		return nil, ctap2.ErrPinInvalid
 	}
 
 	s.pin.consecutiveFailures = 0
-	return s.pins.SetPINRetries(maxPINRetries)
+	if err := s.pins.SetPINRetries(maxPINRetries); err != nil {
+		return nil, err
+	}
+	return pinHash, nil
 }
 
 // decryptNewPIN decrypts and validates a padded new PIN and returns its

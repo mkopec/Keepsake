@@ -1,6 +1,7 @@
 package tpm
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -15,11 +16,23 @@ const DefaultPINIndex = 0x0100F1D1
 // dictionary attack protection is in lockout mode.
 var ErrLockout = errors.New("TPM is in dictionary attack lockout")
 
-// The PIN index's authValue is the PIN hash and its single byte of data is
-// the remaining PIN retries. The owner can read and write the retries
-// counter; reading the index with its own authValue proves knowledge of the
-// PIN. NoDA is clear so wrong PINs count towards the TPM's dictionary attack
-// lockout, which limits guessing even when bypassing tpm-fido.
+// Layout of the PIN index data:
+//
+//	offset 0: remaining PIN retries
+//	offset 1: big endian length of the UV key blob
+//	offset 3: UV key blob
+const (
+	pinDataSize       = 384
+	pinRetriesOffset  = 0
+	uvKeyBlobOffset   = 1
+	maxUVKeyBlobSize  = pinDataSize - uvKeyBlobOffset - 2
+	uvKeyBlobLenBytes = 2
+)
+
+// The PIN index's authValue is the PIN hash. The owner can read and write
+// its data; reading the index with its own authValue proves knowledge of
+// the PIN. NoDA is clear so wrong PINs count towards the TPM's dictionary
+// attack lockout, which limits guessing even when bypassing tpm-fido.
 func pinNVPublic(index uint32) tpm2.TPMSNVPublic {
 	return tpm2.TPMSNVPublic{
 		NVIndex: tpm2.TPMIRHNVIndex(index),
@@ -30,7 +43,7 @@ func pinNVPublic(index uint32) tpm2.TPMSNVPublic {
 			AuthRead:   true,
 			NT:         tpm2.TPMNTOrdinary,
 		},
-		DataSize: 1,
+		DataSize: pinDataSize,
 	}
 }
 
@@ -39,31 +52,48 @@ var ownerAuth = tpm2.AuthHandle{
 	Auth:   tpm2.PasswordAuth(nil),
 }
 
-// pinIndex returns the name of the PIN index, or ok=false if no PIN is set.
-func (t *TPM) pinIndex(tpm transport.TPM) (name tpm2.TPM2BName, ok bool, err error) {
+// pinIndex returns the name of the PIN index and whether it exists. An index
+// that exists but was never written is left over from an interrupted SetPIN
+// and doesn't hold a PIN.
+func (t *TPM) pinIndex(tpm transport.TPM) (name tpm2.TPM2BName, exists, written bool, err error) {
 	rsp, err := tpm2.NVReadPublic{NVIndex: tpm2.TPMHandle(t.pinIndexHandle)}.Execute(tpm)
 	if errors.Is(err, tpm2.TPMRCHandle) {
-		return name, false, nil
+		return name, false, false, nil
 	}
 	if err != nil {
-		return name, false, fmt.Errorf("read PIN index public err: %w", err)
+		return name, false, false, fmt.Errorf("read PIN index public err: %w", err)
 	}
 
 	pub, err := rsp.NVPublic.Contents()
 	if err != nil {
-		return name, false, err
+		return name, false, false, err
 	}
 	want := pinNVPublic(t.pinIndexHandle)
 	attrs := pub.Attributes
-	written := attrs.Written
+	written = attrs.Written
 	attrs.Written = false
 	if attrs != want.Attributes || pub.DataSize != want.DataSize || pub.NameAlg != want.NameAlg {
-		return name, false, fmt.Errorf("NV index 0x%08x exists but is not a tpm-fido PIN index", t.pinIndexHandle)
+		return name, false, false, fmt.Errorf("NV index 0x%08x exists but is not a tpm-fido PIN index", t.pinIndexHandle)
 	}
 
-	// An index that was never written is left over from an interrupted
-	// SetPIN.
-	return rsp.NVName, written, nil
+	return rsp.NVName, true, written, nil
+}
+
+// pinIndexWritten returns the name of the PIN index, or an error if no PIN
+// is set.
+func (t *TPM) pinIndexWritten(tpm transport.TPM) (tpm2.TPM2BName, error) {
+	name, _, written, err := t.pinIndex(tpm)
+	if err != nil {
+		return name, err
+	}
+	if !written {
+		return name, errors.New("PIN not set")
+	}
+	return name, nil
+}
+
+func (t *TPM) pinIndexHandleNamed(name tpm2.TPM2BName) tpm2.NamedHandle {
+	return tpm2.NamedHandle{Handle: tpm2.TPMHandle(t.pinIndexHandle), Name: name}
 }
 
 func (t *TPM) withTPM(f func(tpm transport.TPM) error) error {
@@ -84,32 +114,50 @@ func (t *TPM) PINSet() (bool, error) {
 	var set bool
 	err := t.withTPM(func(tpm transport.TPM) error {
 		var err error
-		_, set, err = t.pinIndex(tpm)
+		_, _, set, err = t.pinIndex(tpm)
 		return err
 	})
 	return set, err
 }
 
-// SetPIN stores pinHash as the PIN, replacing any existing PIN, and sets the
-// retries counter to retries.
-func (t *TPM) SetPIN(pinHash []byte, retries int) error {
+// SetPIN stores pinHash as the PIN and sets the retries counter to
+// retries. When changing the PIN, oldPinHash must be the current PIN hash so
+// the UV key can be re-wrapped; otherwise it is nil and a new UV key is
+// created.
+func (t *TPM) SetPIN(pinHash, oldPinHash []byte, retries int) error {
 	return t.withTPM(func(tpm transport.TPM) error {
-		_, err := tpm2.NVReadPublic{NVIndex: tpm2.TPMHandle(t.pinIndexHandle)}.Execute(tpm)
-		if err == nil {
-			// pinIndex checks the index is ours before deleting it
-			name, _, err := t.pinIndex(tpm)
+		name, exists, written, err := t.pinIndex(tpm)
+		if err != nil {
+			return err
+		}
+
+		srk, err := createSRK(tpm)
+		if err != nil {
+			return err
+		}
+		defer flush(tpm, srk.ObjectHandle)
+
+		var blob []byte
+		if written && oldPinHash != nil {
+			old, err := t.readUVKeyBlob(tpm, name)
 			if err != nil {
 				return err
 			}
+			if blob, err = changeUVKeyAuth(tpm, srk, old, oldPinHash, pinHash); err != nil {
+				return err
+			}
+		} else if blob, err = createUVKey(tpm, srk, pinHash); err != nil {
+			return err
+		}
+
+		if exists {
 			_, err = tpm2.NVUndefineSpace{
 				AuthHandle: ownerAuth,
-				NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(t.pinIndexHandle), Name: name},
+				NVIndex:    t.pinIndexHandleNamed(name),
 			}.Execute(tpm)
 			if err != nil {
 				return fmt.Errorf("undefine PIN index err: %w", err)
 			}
-		} else if !errors.Is(err, tpm2.TPMRCHandle) {
-			return fmt.Errorf("read PIN index public err: %w", err)
 		}
 
 		_, err = tpm2.NVDefineSpace{
@@ -121,11 +169,24 @@ func (t *TPM) SetPIN(pinHash []byte, retries int) error {
 			return fmt.Errorf("define PIN index 0x%08x (requires empty owner auth) err: %w", t.pinIndexHandle, err)
 		}
 
-		name, _, err := t.pinIndex(tpm)
+		name, _, _, err = t.pinIndex(tpm)
 		if err != nil {
 			return err
 		}
-		return t.writeRetries(tpm, name, retries)
+
+		data := make([]byte, pinDataSize)
+		data[pinRetriesOffset] = byte(retries)
+		binary.BigEndian.PutUint16(data[uvKeyBlobOffset:], uint16(len(blob)))
+		copy(data[uvKeyBlobOffset+uvKeyBlobLenBytes:], blob)
+		_, err = tpm2.NVWrite{
+			AuthHandle: ownerAuth,
+			NVIndex:    t.pinIndexHandleNamed(name),
+			Data:       tpm2.TPM2BMaxNVBuffer{Buffer: data},
+		}.Execute(tpm)
+		if err != nil {
+			return fmt.Errorf("write PIN index err: %w", err)
+		}
+		return nil
 	})
 }
 
@@ -133,17 +194,15 @@ func (t *TPM) SetPIN(pinHash []byte, retries int) error {
 func (t *TPM) PINRetries() (int, error) {
 	var retries int
 	err := t.withTPM(func(tpm transport.TPM) error {
-		name, ok, err := t.pinIndex(tpm)
+		name, err := t.pinIndexWritten(tpm)
 		if err != nil {
 			return err
 		}
-		if !ok {
-			return errors.New("PIN not set")
-		}
 		rsp, err := tpm2.NVRead{
 			AuthHandle: ownerAuth,
-			NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(t.pinIndexHandle), Name: name},
+			NVIndex:    t.pinIndexHandleNamed(name),
 			Size:       1,
+			Offset:     pinRetriesOffset,
 		}.Execute(tpm)
 		if err != nil {
 			return fmt.Errorf("read PIN retries err: %w", err)
@@ -157,27 +216,21 @@ func (t *TPM) PINRetries() (int, error) {
 // SetPINRetries stores the remaining PIN retries.
 func (t *TPM) SetPINRetries(retries int) error {
 	return t.withTPM(func(tpm transport.TPM) error {
-		name, ok, err := t.pinIndex(tpm)
+		name, err := t.pinIndexWritten(tpm)
 		if err != nil {
 			return err
 		}
-		if !ok {
-			return errors.New("PIN not set")
+		_, err = tpm2.NVWrite{
+			AuthHandle: ownerAuth,
+			NVIndex:    t.pinIndexHandleNamed(name),
+			Data:       tpm2.TPM2BMaxNVBuffer{Buffer: []byte{byte(retries)}},
+			Offset:     pinRetriesOffset,
+		}.Execute(tpm)
+		if err != nil {
+			return fmt.Errorf("write PIN retries err: %w", err)
 		}
-		return t.writeRetries(tpm, name, retries)
+		return nil
 	})
-}
-
-func (t *TPM) writeRetries(tpm transport.TPM, name tpm2.TPM2BName, retries int) error {
-	_, err := tpm2.NVWrite{
-		AuthHandle: ownerAuth,
-		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(t.pinIndexHandle), Name: name},
-		Data:       tpm2.TPM2BMaxNVBuffer{Buffer: []byte{byte(retries)}},
-	}.Execute(tpm)
-	if err != nil {
-		return fmt.Errorf("write PIN retries err: %w", err)
-	}
-	return nil
 }
 
 // VerifyPIN reports whether pinHash matches the stored PIN. It doesn't
@@ -186,12 +239,9 @@ func (t *TPM) writeRetries(tpm transport.TPM, name tpm2.TPM2BName, retries int) 
 func (t *TPM) VerifyPIN(pinHash []byte) (bool, error) {
 	var match bool
 	err := t.withTPM(func(tpm transport.TPM) error {
-		name, ok, err := t.pinIndex(tpm)
+		name, err := t.pinIndexWritten(tpm)
 		if err != nil {
 			return err
-		}
-		if !ok {
-			return errors.New("PIN not set")
 		}
 		_, err = tpm2.NVRead{
 			AuthHandle: tpm2.AuthHandle{
@@ -199,20 +249,46 @@ func (t *TPM) VerifyPIN(pinHash []byte) (bool, error) {
 				Name:   name,
 				Auth:   tpm2.PasswordAuth(pinHash),
 			},
-			NVIndex: tpm2.NamedHandle{Handle: tpm2.TPMHandle(t.pinIndexHandle), Name: name},
+			NVIndex: t.pinIndexHandleNamed(name),
 			Size:    1,
 		}.Execute(tpm)
-		switch {
-		case err == nil:
-			match = true
-		case errors.Is(err, tpm2.TPMRCAuthFail), errors.Is(err, tpm2.TPMRCBadAuth):
-			match = false
-		case errors.Is(err, tpm2.TPMRCLockout):
-			return ErrLockout
-		default:
+		match, err = classifyAuthErr(err)
+		if err != nil {
 			return fmt.Errorf("verify PIN err: %w", err)
 		}
 		return nil
 	})
 	return match, err
+}
+
+// classifyAuthErr maps the result of a command authorized with the PIN hash
+// to whether the PIN matched.
+func classifyAuthErr(err error) (bool, error) {
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, tpm2.TPMRCAuthFail), errors.Is(err, tpm2.TPMRCBadAuth):
+		return false, nil
+	case errors.Is(err, tpm2.TPMRCLockout):
+		return false, ErrLockout
+	}
+	return false, err
+}
+
+func (t *TPM) readUVKeyBlob(tpm transport.TPM, name tpm2.TPM2BName) ([]byte, error) {
+	rsp, err := tpm2.NVRead{
+		AuthHandle: ownerAuth,
+		NVIndex:    t.pinIndexHandleNamed(name),
+		Size:       pinDataSize - uvKeyBlobOffset,
+		Offset:     uvKeyBlobOffset,
+	}.Execute(tpm)
+	if err != nil {
+		return nil, fmt.Errorf("read UV key err: %w", err)
+	}
+	data := rsp.Data.Buffer
+	n := int(binary.BigEndian.Uint16(data))
+	if n == 0 || n > len(data)-uvKeyBlobLenBytes {
+		return nil, errors.New("no UV key in PIN index")
+	}
+	return data[uvKeyBlobLenBytes : uvKeyBlobLenBytes+n], nil
 }

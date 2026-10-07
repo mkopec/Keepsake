@@ -16,7 +16,7 @@ On an authentication request, tpm-fido will attempt to load the primary key by i
 
 tpm-fido speaks both U2F (CTAP1) and CTAP 2.0. The CTAP2 `rpIdHash` is the same value as the U2F application parameter, so CTAP2 credential IDs use the key handle format described above, and credentials registered over U2F keep working over CTAP2.
 
-Supported: `authenticatorMakeCredential` (ES256 only, "packed" self attestation), `authenticatorGetAssertion`, `authenticatorGetInfo` and `authenticatorClientPIN` (PIN protocols 1 and 2). Not supported yet: discoverable (resident) credentials, `authenticatorReset` and extensions such as `hmac-secret`.
+Supported: `authenticatorMakeCredential` (ES256 only, "packed" self attestation), `authenticatorGetAssertion`, `authenticatorGetInfo`, `authenticatorClientPIN` (PIN protocols 1 and 2) and the `hmac-secret` extension. Not supported yet: discoverable (resident) credentials and `authenticatorReset`.
 
 User presence is confirmed through `pinentry`, with the relying party ID and user name shown in the prompt.
 
@@ -31,12 +31,30 @@ The PIN is stored in the TPM in NV index `0x0100F1D1` (change it with `-pin-inde
 * The index's authorization value is `LEFT(SHA-256(PIN), 16)`, the PIN hash defined by CTAP. tpm-fido checks a PIN by reading the index with that authorization value. The PIN hash is never stored on disk.
 * The index's single byte of data is the remaining PIN retries. It is decremented before each check and reset after a correct PIN. After 8 wrong PINs the PIN is blocked; after 3 in a row tpm-fido must be restarted (the equivalent of unplugging a security key).
 * The index doesn't have `noDA` set, so every wrong PIN also counts towards the TPM's dictionary attack lockout. This limits guessing even for software that talks to the TPM directly instead of going through tpm-fido. While the TPM is in lockout, PIN checks fail with `PIN_AUTH_BLOCKED` without using up a retry. Note that the lockout is TPM-wide: wrong FIDO PINs also count towards the lockout of other DA-protected objects (for example a TPM+PIN LUKS key), and vice versa. `tpm2_getcap properties-variable` shows the TPM's `MAX_AUTH_FAIL` and `LOCKOUT_INTERVAL`.
+* The lockout only limits guessing if the TPM's lockout authorization is set (`tpm2_changeauth -c lockout`). With an empty lockout authorization, anyone who can use the TPM can reset the lockout counter (`tpm2_dictionarylockout -c`) and guess without limit. The retries counter doesn't help either: it can be rewritten with the (empty) owner authorization.
 
 Limitations:
 
 * The PIN only gates what tpm-fido does. The credential keys aren't bound to the PIN, so software running as your user can still use them through the TPM directly.
 * The PIN hash is sent to the TPM in a password session, so it is visible on the bus to an attacker with physical access to a discrete TPM.
-* There is no `authenticatorReset`. To remove a blocked or forgotten PIN, delete the index with `tpm2_nvundefine -C o 0x0100F1D1`. Unlike a reset, this keeps the existing credentials.
+* There is no `authenticatorReset`. To remove a blocked or forgotten PIN, delete the index with `tpm2_nvundefine -C o 0x0100F1D1`. Unlike a reset, this keeps the existing credentials, but it destroys the UV key, so every hmac-secret secret that was derived with user verification (for example a LUKS key enrolled with `--fido2-with-client-pin=yes`) is lost.
+
+### hmac-secret
+
+Credentials created with the `hmac-secret` extension can derive secrets from salts, which is what `systemd-cryptenroll --fido2-device`, `age-plugin-fido2-hmac` and similar tools use. Each credential has two secrets (`CredRandomWithoutUV` and `CredRandomWithUV` in CTAP 2.1). tpm-fido derives them by HMACing the relying party and credential ID with one of two TPM keys:
+
+* Without user verification: a keyed hash primary key in the owner hierarchy. It never leaves the TPM and is lost when the TPM is cleared, but it is derived from the owner seed, so **anyone who can use the TPM can recompute these secrets**, including someone who boots another OS on the machine. The credential ID is not secret (systemd stores it in the LUKS header).
+* With user verification (a PIN): an ordinary keyed hash key whose authorization value is the PIN hash. It is stored, wrapped by the TPM, in the PIN index. Computing these secrets requires the PIN, even with direct access to the TPM, and guessing it counts towards the TPM's dictionary attack lockout. Changing the PIN re-wraps the same key (`TPM2_ObjectChangeAuth`), so the secrets survive PIN changes.
+
+For disk encryption, enroll with a PIN:
+
+```
+systemd-cryptenroll --fido2-device=auto --fido2-with-client-pin=yes /dev/sdXn
+```
+
+Both secrets are lost when the TPM is cleared or replaced, so keep another way to unlock (a recovery key or passphrase).
+
+tpm-fido keeps the PIN hash in memory while the PIN token it was issued for is valid (until the next `getPinToken`, PIN change or restart), because the UV key needs it at assertion time.
 
 ### Signature counter
 

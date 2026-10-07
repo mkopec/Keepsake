@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -90,24 +91,65 @@ func (t *TPM) ensureCounter(tpm io.ReadWriter) error {
 	return nil
 }
 
-// keyHandleVersionNoDA prefixes the seed in key handles whose keys have
-// noDA set. The keys have an empty authValue, so dictionary attack
-// protection doesn't protect anything; without noDA they can't be used while
-// the TPM is in lockout, e.g. after wrong PIN guesses. Key handles with a
-// bare 20 byte seed were created without noDA. The flag changes the primary
-// key template, so it can't be changed for existing key handles.
-const keyHandleVersionNoDA = 0x01
+// Key handles created by current versions prefix the seed with a version
+// byte. Their keys have noDA set: the keys have an empty authValue, so
+// dictionary attack protection doesn't protect anything, and without noDA
+// they can't be used while the TPM is in lockout, e.g. after wrong PIN
+// guesses. Key handles with a bare 20 byte seed were created without noDA.
+// The flag changes the primary key template, so it can't be changed for
+// existing key handles.
+const (
+	keyHandleVersionNoDA = 0x01
+	// like keyHandleVersionNoDA, for credentials created with the
+	// hmac-secret extension
+	keyHandleVersionHMACSecret = 0x02
+)
+
+type keyHandleFlags struct {
+	noDA       bool
+	hmacSecret bool
+}
 
 // parseSeed splits the seed field of a key handle into the HKDF seed and
-// the key attributes to use.
-func parseSeed(field []byte) (seed []byte, noDA bool, err error) {
-	switch {
-	case len(field) == seedSizeBytes:
-		return field, false, nil
-	case len(field) == seedSizeBytes+1 && field[0] == keyHandleVersionNoDA:
-		return field[1:], true, nil
+// the key handle flags.
+func parseSeed(field []byte) (seed []byte, flags keyHandleFlags, err error) {
+	if len(field) == seedSizeBytes {
+		return field, flags, nil
 	}
-	return nil, false, fmt.Errorf("invalid key handle seed")
+	if len(field) == seedSizeBytes+1 {
+		switch field[0] {
+		case keyHandleVersionNoDA:
+			return field[1:], keyHandleFlags{noDA: true}, nil
+		case keyHandleVersionHMACSecret:
+			return field[1:], keyHandleFlags{noDA: true, hmacSecret: true}, nil
+		}
+	}
+	return nil, flags, fmt.Errorf("invalid key handle seed")
+}
+
+var errInvalidHandle = errors.New("invalid key handle")
+
+// decodeKeyHandle splits a key handle into its fields.
+func decodeKeyHandle(keyHandle []byte) (private, public, seed []byte, flags keyHandleFlags, err error) {
+	dec := lencode.NewDecoder(bytes.NewReader(keyHandle), lencode.SeparatorOpt(separator))
+
+	if private, err = dec.Decode(); err != nil {
+		return nil, nil, nil, flags, errInvalidHandle
+	}
+	if public, err = dec.Decode(); err != nil {
+		return nil, nil, nil, flags, errInvalidHandle
+	}
+	seedField, err := dec.Decode()
+	if err != nil {
+		return nil, nil, nil, flags, errInvalidHandle
+	}
+	if _, err = dec.Decode(); err != io.EOF {
+		return nil, nil, nil, flags, errInvalidHandle
+	}
+	if seed, flags, err = parseSeed(seedField); err != nil {
+		return nil, nil, nil, flags, errInvalidHandle
+	}
+	return private, public, seed, flags, nil
 }
 
 func primaryKeyTmpl(seed, applicationParam []byte, noDA bool) tpm2.Public {
@@ -175,8 +217,9 @@ func (t *TPM) Counter() (uint32, error) {
 }
 
 // Register a new key with the TPM for the given applicationParam.
-// RegisterKey returns the KeyHandle or an error.
-func (t *TPM) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, error) {
+// RegisterKey returns the KeyHandle or an error. hmacSecret enables the
+// hmac-secret extension for the key.
+func (t *TPM) RegisterKey(applicationParam []byte, hmacSecret bool) ([]byte, *big.Int, *big.Int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -187,7 +230,11 @@ func (t *TPM) RegisterKey(applicationParam []byte) ([]byte, *big.Int, *big.Int, 
 	defer tpm.Close()
 
 	randSeed := mustRand(seedSizeBytes)
-	seedField := append([]byte{keyHandleVersionNoDA}, randSeed...)
+	version := byte(keyHandleVersionNoDA)
+	if hmacSecret {
+		version = keyHandleVersionHMACSecret
+	}
+	seedField := append([]byte{version}, randSeed...)
 
 	primaryTmpl := primaryKeyTmpl(randSeed, applicationParam, true)
 
@@ -258,36 +305,12 @@ func (t *TPM) SignASN1(keyHandle, applicationParam, digest []byte) ([]byte, erro
 	}
 	defer tpm.Close()
 
-	dec := lencode.NewDecoder(bytes.NewReader(keyHandle), lencode.SeparatorOpt(separator))
-
-	invalidHandleErr := fmt.Errorf("invalid key handle")
-
-	private, err := dec.Decode()
+	private, public, seed, flags, err := decodeKeyHandle(keyHandle)
 	if err != nil {
-		return nil, invalidHandleErr
+		return nil, err
 	}
 
-	public, err := dec.Decode()
-	if err != nil {
-		return nil, invalidHandleErr
-	}
-
-	seedField, err := dec.Decode()
-	if err != nil {
-		return nil, invalidHandleErr
-	}
-
-	_, err = dec.Decode()
-	if err != io.EOF {
-		return nil, invalidHandleErr
-	}
-
-	seed, noDA, err := parseSeed(seedField)
-	if err != nil {
-		return nil, invalidHandleErr
-	}
-
-	srkTemplate := primaryKeyTmpl(seed, applicationParam, noDA)
+	srkTemplate := primaryKeyTmpl(seed, applicationParam, flags.noDA)
 
 	parentHandle, _, err := tpm2.CreatePrimary(tpm, tpm2.HandleOwner, tpm2.PCRSelection{}, "", "", srkTemplate)
 	if err != nil {

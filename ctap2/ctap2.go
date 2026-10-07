@@ -104,6 +104,9 @@ func Unmarshal(data []byte, v interface{}) error {
 	return nil
 }
 
+// Extensions maps extension identifiers to their undecoded CBOR inputs.
+type Extensions = map[string]cbor.RawMessage
+
 type RelyingParty struct {
 	ID   string `cbor:"id"`
 	Name string `cbor:"name,omitempty"`
@@ -129,25 +132,25 @@ type CredentialDescriptor struct {
 }
 
 type MakeCredentialReq struct {
-	ClientDataHash    []byte                     `cbor:"1,keyasint"`
-	RP                *RelyingParty              `cbor:"2,keyasint"`
-	User              *User                      `cbor:"3,keyasint"`
-	PubKeyCredParams  []CredentialParameter      `cbor:"4,keyasint"`
-	ExcludeList       []CredentialDescriptor     `cbor:"5,keyasint"`
-	Extensions        map[string]cbor.RawMessage `cbor:"6,keyasint"`
-	Options           map[string]bool            `cbor:"7,keyasint"`
-	PinUvAuthParam    *[]byte                    `cbor:"8,keyasint"`
-	PinUvAuthProtocol uint                       `cbor:"9,keyasint"`
+	ClientDataHash    []byte                 `cbor:"1,keyasint"`
+	RP                *RelyingParty          `cbor:"2,keyasint"`
+	User              *User                  `cbor:"3,keyasint"`
+	PubKeyCredParams  []CredentialParameter  `cbor:"4,keyasint"`
+	ExcludeList       []CredentialDescriptor `cbor:"5,keyasint"`
+	Extensions        Extensions             `cbor:"6,keyasint"`
+	Options           map[string]bool        `cbor:"7,keyasint"`
+	PinUvAuthParam    *[]byte                `cbor:"8,keyasint"`
+	PinUvAuthProtocol uint                   `cbor:"9,keyasint"`
 }
 
 type GetAssertionReq struct {
-	RPID              string                     `cbor:"1,keyasint"`
-	ClientDataHash    []byte                     `cbor:"2,keyasint"`
-	AllowList         []CredentialDescriptor     `cbor:"3,keyasint"`
-	Extensions        map[string]cbor.RawMessage `cbor:"4,keyasint"`
-	Options           map[string]bool            `cbor:"5,keyasint"`
-	PinUvAuthParam    *[]byte                    `cbor:"6,keyasint"`
-	PinUvAuthProtocol uint                       `cbor:"7,keyasint"`
+	RPID              string                 `cbor:"1,keyasint"`
+	ClientDataHash    []byte                 `cbor:"2,keyasint"`
+	AllowList         []CredentialDescriptor `cbor:"3,keyasint"`
+	Extensions        Extensions             `cbor:"4,keyasint"`
+	Options           map[string]bool        `cbor:"5,keyasint"`
+	PinUvAuthParam    *[]byte                `cbor:"6,keyasint"`
+	PinUvAuthProtocol uint                   `cbor:"7,keyasint"`
 }
 
 type GetInfoResp struct {
@@ -190,16 +193,20 @@ func COSEKeyES256(x, y *big.Int) ([]byte, error) {
 }
 
 // AuthenticatorData builds the WebAuthn authenticatorData structure.
-// attestedCredData may be nil.
-func AuthenticatorData(rpIDHash []byte, flags byte, signCount uint32, attestedCredData []byte) []byte {
+// attestedCredData and extensions (a CBOR map) may be nil.
+func AuthenticatorData(rpIDHash []byte, flags byte, signCount uint32, attestedCredData, extensions []byte) []byte {
 	var buf bytes.Buffer
 	buf.Write(rpIDHash)
 	if attestedCredData != nil {
 		flags |= FlagAttestedCredentialData
 	}
+	if extensions != nil {
+		flags |= FlagExtensionData
+	}
 	buf.WriteByte(flags)
 	binary.Write(&buf, binary.BigEndian, signCount)
 	buf.Write(attestedCredData)
+	buf.Write(extensions)
 	return buf.Bytes()
 }
 
