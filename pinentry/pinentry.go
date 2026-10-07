@@ -62,6 +62,47 @@ func (pe *Pinentry) Confirm(ctx context.Context, prompt ui.Prompt) (bool, error)
 	}
 }
 
+// Password asks for a password with pinentry's GETPIN.
+func (pe *Pinentry) Password(ctx context.Context, prompt ui.PasswordPrompt) (string, error) {
+	childCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	p, cmd, err := launchPinEntry(childCtx)
+	if err != nil {
+		return "", fmt.Errorf("failed to start pinentry: %w", err)
+	}
+	defer func() {
+		cancel()
+		cmd.Wait()
+	}()
+
+	defer p.Shutdown()
+	apply(p, prompt.Prompt)
+	if prompt.Warning != "" {
+		p.SetError(prompt.Warning)
+	}
+
+	type result struct {
+		pin string
+		err error
+	}
+	res := make(chan result, 1)
+	go func() {
+		pin, err := p.GetPIN()
+		res <- result{pin, err}
+	}()
+
+	select {
+	case r := <-res:
+		if r.err != nil {
+			// pinentry answers a cancelled dialog with an error
+			return "", ui.ErrCancelled
+		}
+		return r.pin, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
 func FindPinentryGUIPath() string {
 	candidates := []string{
 		"pinentry-gnome3",

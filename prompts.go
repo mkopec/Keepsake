@@ -75,6 +75,32 @@ func selectPrompt() ui.Prompt {
 	}
 }
 
+// sshPINPrompt asks for the PIN on behalf of an SSH agent. message is the
+// agent's prompt, e.g. "Enter PIN and confirm user presence for ECDSA-SK key
+// SHA256:...: ". Entering the PIN also confirms the signature, so the
+// confirming button signs in.
+func sshPINPrompt(message string) ui.PasswordPrompt {
+	body := "Enter the PIN of the security key in this computer to sign in with SSH."
+	if fp := sshKeyFingerprint(message); fp != "" {
+		body = fmt.Sprintf("Enter the PIN of the security key in this computer to sign in with SSH key %s.", fp)
+	}
+	return ui.PasswordPrompt{Prompt: ui.Prompt{
+		Heading: "Sign In with SSH Key?",
+		Body:    body,
+		OK:      "Sign In",
+	}}
+}
+
+// sshKeyFingerprint returns the "SHA256:..." fingerprint in an ssh prompt.
+func sshKeyFingerprint(message string) string {
+	for _, f := range strings.Fields(message) {
+		if strings.HasPrefix(f, "SHA256:") {
+			return displayText(strings.TrimRight(f, ":"), 60)
+		}
+	}
+	return ""
+}
+
 func resetPrompt() ui.Prompt {
 	return ui.Prompt{
 		Heading: "Reset Security Key?",

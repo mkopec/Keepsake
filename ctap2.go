@@ -101,12 +101,14 @@ func (s *server) dispatchCBOR(evt fidohid.AuthEvent, ka *keepalive) (interface{}
 		}
 		return s.clientPIN(&req)
 	case ctap2.CmdMakeCredential:
+		s.noteRequest()
 		var req ctap2.MakeCredentialReq
 		if err := ctap2.Unmarshal(params, &req); err != nil {
 			return nil, err
 		}
 		return s.makeCredential(evt, ka, &req)
 	case ctap2.CmdGetAssertion:
+		s.noteRequest()
 		var req ctap2.GetAssertionReq
 		if err := ctap2.Unmarshal(params, &req); err != nil {
 			return nil, err
@@ -328,8 +330,10 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 
 	var flags byte
 	if up {
-		if err := s.confirmPresence(evt, ka, signInPrompt(displayText(req.RPID, 253))); err != nil {
-			return nil, err
+		if !s.usePresenceGrant(uv) {
+			if err := s.confirmPresence(evt, ka, signInPrompt(displayText(req.RPID, 253))); err != nil {
+				return nil, err
+			}
 		}
 		flags |= ctap2.FlagUserPresent
 	}

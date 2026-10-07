@@ -134,14 +134,19 @@ Stopping the service (`systemctl --user stop tpm-fido`) removes the virtual secu
 
 `ssh-keygen -t ecdsa-sk` works with tpm-fido; with `-O verify-required` every signature also needs the PIN. ssh asks for the PIN in the terminal, but an SSH agent has no terminal and asks through `SSH_ASKPASS`; without one it refuses to sign ("agent refused operation"). GNOME's agent (`gcr-ssh-agent`, `SSH_AUTH_SOCK=/run/user/$UID/gcr/ssh`) has none configured.
 
-`tpm-fido-askpass` asks with the GNOME system prompt, the same dialog as tpm-fido's confirmations. The PIN travels from the prompt encrypted with gcr's secret exchange. To use it with GNOME's agent:
+`tpm-fido-askpass` is an askpass program for GNOME. To use it with GNOME's agent:
 
 ```
 make install
 make enable-gnome-ssh   # adds a drop-in to gcr-ssh-agent.service and restarts it
 ```
 
-Then sign in as usual: GNOME asks for the security key PIN, then tpm-fido for confirmation. `make disable-gnome-ssh` removes the drop-in. It also works with OpenSSH's own agent: set `SSH_ASKPASS` to `tpm-fido-askpass` and `SSH_ASKPASS_REQUIRE=force` in its environment.
+* **Security key PINs:** if tpm-fido runs, tpm-fido-askpass asks it for the PIN over D-Bus (`io.github.psanford.TpmFido`), and tpm-fido shows a single "Sign In with SSH Key?" prompt. Typing the PIN into a prompt tpm-fido showed proves that you are present, so the signature that follows doesn't show tpm-fido's confirmation dialog: one prompt instead of two. This presence grant is used once, expires after 15 seconds, and only applies to a request whose verified PIN is the one you typed. Other programs can ask tpm-fido to show the prompt (as they could show any prompt), but can't answer it. Without tpm-fido (e.g. for a hardware key), it asks with the GNOME system prompt; the PIN travels from the prompt encrypted with gcr's secret exchange. Disable the combined prompt with `tpm-fido -askpass-service=false`.
+* **Key passphrases and `ssh-add -c` confirmations:** GNOME system prompt. gcr-ssh-agent's own passphrase prompts for keys in `~/.ssh` (with "remember in keyring") are unaffected: gcr runs `ssh-add` with its own askpass.
+* **"Touch your security key":** a desktop notification, unless tpm-fido handles the request (it shows its own dialog).
+* Without a GNOME system prompter it runs `$TPMFIDO_ASKPASS_FALLBACK` or OpenSSH's `ssh-askpass`.
+
+`make disable-gnome-ssh` removes the drop-in. It also works with OpenSSH's own agent: set `SSH_ASKPASS` to `tpm-fido-askpass` and `SSH_ASKPASS_REQUIRE=force` in its environment.
 
 ### Security Keys app
 

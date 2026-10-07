@@ -152,7 +152,7 @@ func TestSystemPrompter(t *testing.T) {
 	}
 
 	// password prompt: the typed text comes back through the exchange
-	pw := PasswordPrompt{Prompt: ui.Prompt{Heading: "Enter Security Key PIN", Body: "test", OK: "Continue"}}
+	pw := ui.PasswordPrompt{Prompt: ui.Prompt{Heading: "Enter Security Key PIN", Body: "test", OK: "Continue"}}
 	go func() {
 		out, err := exec.Command("xdotool", "search", "--sync", "--name", pw.Heading).Output()
 		if err != nil {

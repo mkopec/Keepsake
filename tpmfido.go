@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/psanford/tpm-fido/attestation"
@@ -55,6 +56,10 @@ type server struct {
 	storeKey      []byte
 	nextAssertion *assertionState
 	credMgmt      *credMgmtState
+
+	// see askpassservice.go
+	grant       presenceGrant
+	lastRequest atomic.Int64
 }
 
 type Signer interface {
@@ -204,9 +209,11 @@ func (s *server) handleEvent(ctx context.Context, token *fidohid.SoftToken, evt 
 	if req.Command == fidoauth.CmdAuthenticate {
 		log.Printf("got AuthenticateCmd site=%s", sitesignatures.FromAppParam(req.Authenticate.ApplicationParam))
 
+		s.noteRequest()
 		s.handleAuthenticate(ctx, token, evt)
 	} else if req.Command == fidoauth.CmdRegister {
 		log.Printf("got RegisterCmd site=%s", sitesignatures.FromAppParam(req.Register.ApplicationParam))
+		s.noteRequest()
 		s.handleRegister(ctx, token, evt)
 	} else if req.Command == fidoauth.CmdVersion {
 		log.Print("got VersionCmd")

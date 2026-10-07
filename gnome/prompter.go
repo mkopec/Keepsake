@@ -95,19 +95,12 @@ func (p *Prompter) Confirm(ctx context.Context, prompt ui.Prompt) (bool, error) 
 	return r.reply == "yes", nil
 }
 
-// PasswordPrompt is a password prompt.
-type PasswordPrompt struct {
-	ui.Prompt
-	// Warning is shown in the prompt, e.g. after a wrong password.
-	Warning string
-}
-
 // ErrCancelled is returned by Password when the user cancels the prompt.
-var ErrCancelled = errors.New("prompt cancelled")
+var ErrCancelled = ui.ErrCancelled
 
 // Password asks for a password. The password travels from the prompter
 // encrypted with the gcr secret exchange.
-func (p *Prompter) Password(ctx context.Context, prompt PasswordPrompt) (string, error) {
+func (p *Prompter) Password(ctx context.Context, prompt ui.PasswordPrompt) (string, error) {
 	ex, err := newSecretExchange()
 	if err != nil {
 		return "", err
@@ -139,10 +132,9 @@ func props(prompt ui.Prompt) map[string]dbus.Variant {
 
 // perform shows one prompt and returns the prompter's reply.
 func (p *Prompter) perform(ctx context.Context, typ string, props map[string]dbus.Variant, exchange string) (reply, error) {
-	var owner string
-	err := p.conn.BusObject().CallWithContext(ctx, "org.freedesktop.DBus.GetNameOwner", 0, prompterBusName).Store(&owner)
+	owner, err := p.owner(ctx)
 	if err != nil {
-		return reply{}, fmt.Errorf("system prompter not available: %w", err)
+		return reply{}, err
 	}
 
 	path := dbus.ObjectPath(fmt.Sprintf("%s/%d", callbackPathPrefix, p.seq.Add(1)))
@@ -185,6 +177,25 @@ func (p *Prompter) perform(ctx context.Context, typ string, props map[string]dbu
 		return reply{}, fmt.Errorf("perform prompt err: %w", err)
 	}
 	return cb.wait(ctx)
+}
+
+// owner returns the unique name of the prompter, starting it if it is
+// D-Bus activatable (gcr-prompter) and not running. GNOME Shell's prompter
+// always runs.
+func (p *Prompter) owner(ctx context.Context) (string, error) {
+	var owner string
+	bus := p.conn.BusObject()
+	if bus.CallWithContext(ctx, "org.freedesktop.DBus.GetNameOwner", 0, prompterBusName).Store(&owner) == nil {
+		return owner, nil
+	}
+	var started uint32
+	if err := bus.CallWithContext(ctx, "org.freedesktop.DBus.StartServiceByName", 0, prompterBusName, uint32(0)).Store(&started); err != nil {
+		return "", fmt.Errorf("system prompter not available: %w", err)
+	}
+	if err := bus.CallWithContext(ctx, "org.freedesktop.DBus.GetNameOwner", 0, prompterBusName).Store(&owner); err != nil {
+		return "", fmt.Errorf("system prompter not available: %w", err)
+	}
+	return owner, nil
 }
 
 // wait returns the next reply from the prompter. A prompter that stops

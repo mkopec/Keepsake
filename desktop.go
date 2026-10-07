@@ -16,6 +16,7 @@ import (
 
 var promptBackend = flag.String("prompt", "auto", "confirmation dialogs: auto (GNOME system prompt if available, else pinentry), gnome or pinentry")
 var lockCheck = flag.Bool("lock-check", true, "refuse requests while the session is locked or inactive")
+var askpassServiceFlag = flag.Bool("askpass-service", true, "let tpm-fido-askpass ask for SSH security key PINs through tpm-fido (one prompt instead of two)")
 
 // Locker reports whether the user's session is locked.
 type Locker interface {
@@ -39,6 +40,7 @@ func (s *server) setupDesktop() error {
 			return fmt.Errorf("connect to session bus: %w", connErr)
 		}
 		// the prompter is D-Bus activatable, e.g. gcr-prompter
+		log.Print("showing dialogs with the GNOME system prompter")
 		confirmer = gnome.NewPrompter(conn)
 	case "pinentry":
 	default:
@@ -52,6 +54,12 @@ func (s *server) setupDesktop() error {
 		confirmer = pinentry.New()
 	}
 	s.pe = ui.New(confirmer)
+
+	if *askpassServiceFlag && connErr == nil {
+		if err := s.exportAskpassService(conn); err != nil {
+			log.Printf("askpass service not available: %s", err)
+		}
+	}
 
 	if *lockCheck {
 		if connErr != nil {

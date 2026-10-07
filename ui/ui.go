@@ -26,6 +26,28 @@ type Confirmer interface {
 	Confirm(ctx context.Context, p Prompt) (bool, error)
 }
 
+// PasswordPrompt is the content of a password or PIN dialog.
+type PasswordPrompt struct {
+	Prompt
+	// Warning is shown in the dialog, e.g. after a wrong password.
+	Warning string
+}
+
+// PasswordAsker is implemented by Confirmers that can also ask for a
+// password.
+type PasswordAsker interface {
+	// Password blocks until the user answers or ctx is done. It returns
+	// ErrCancelled if the user cancels.
+	Password(ctx context.Context, p PasswordPrompt) (string, error)
+}
+
+// ErrCancelled is returned by Password when the user cancels the dialog.
+var ErrCancelled = errors.New("dialog cancelled")
+
+// ErrUnsupported is returned by Password when the dialog backend can't ask
+// for passwords.
+var ErrUnsupported = errors.New("dialog backend can't ask for passwords")
+
 // ErrBusy is returned when another dialog is already shown.
 var ErrBusy = errors.New("other request already in progress")
 
@@ -65,6 +87,34 @@ func (p *Prompter) Confirm(ctx context.Context, prompt Prompt) (bool, error) {
 		return false, ctx.Err()
 	}
 	return ok, err
+}
+
+// Password shows a password dialog and blocks until the user answers or ctx
+// is done.
+func (p *Prompter) Password(ctx context.Context, prompt PasswordPrompt) (string, error) {
+	asker, ok := p.c.(PasswordAsker)
+	if !ok {
+		return "", ErrUnsupported
+	}
+	p.mu.Lock()
+	if p.busy {
+		p.mu.Unlock()
+		return "", ErrBusy
+	}
+	p.busy = true
+	p.mu.Unlock()
+
+	defer func() {
+		p.mu.Lock()
+		p.busy = false
+		p.mu.Unlock()
+	}()
+
+	secret, err := asker.Password(ctx, prompt)
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	return secret, err
 }
 
 type Result struct {
