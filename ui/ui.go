@@ -48,6 +48,9 @@ var ErrCancelled = errors.New("dialog cancelled")
 // for passwords.
 var ErrUnsupported = errors.New("dialog backend can't ask for passwords")
 
+// ErrRateLimited is returned when Allow refuses a new dialog.
+var ErrRateLimited = errors.New("too many dialogs")
+
 // ErrBusy is returned when another dialog is already shown.
 var ErrBusy = errors.New("other request already in progress")
 
@@ -58,6 +61,10 @@ func New(c Confirmer) *Prompter {
 // Prompter shows at most one dialog at a time.
 type Prompter struct {
 	c Confirmer
+
+	// Allow, if set, is called before a new dialog is shown; if it
+	// returns false the dialog isn't shown and ErrRateLimited returned.
+	Allow func() bool
 
 	mu     sync.Mutex
 	busy   bool
@@ -72,6 +79,10 @@ func (p *Prompter) Confirm(ctx context.Context, prompt Prompt) (bool, error) {
 	if p.busy {
 		p.mu.Unlock()
 		return false, ErrBusy
+	}
+	if p.Allow != nil && !p.Allow() {
+		p.mu.Unlock()
+		return false, ErrRateLimited
 	}
 	p.busy = true
 	p.mu.Unlock()
@@ -100,6 +111,10 @@ func (p *Prompter) Password(ctx context.Context, prompt PasswordPrompt) (string,
 	if p.busy {
 		p.mu.Unlock()
 		return "", ErrBusy
+	}
+	if p.Allow != nil && !p.Allow() {
+		p.mu.Unlock()
+		return "", ErrRateLimited
 	}
 	p.busy = true
 	p.mu.Unlock()
@@ -157,6 +172,9 @@ func (p *Prompter) ConfirmPresence(prompt Prompt, challengeParam, applicationPar
 	}
 	if p.busy {
 		return nil, ErrBusy
+	}
+	if p.Allow != nil && !p.Allow() {
+		return nil, ErrRateLimited
 	}
 
 	req := &polledRequest{

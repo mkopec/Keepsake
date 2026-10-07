@@ -3,6 +3,7 @@ package tpm
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -41,7 +42,14 @@ var (
 // Key handles with a bare 20 byte seed were created by versions without a
 // device key ("legacy"); their primary key is derived from the seed alone.
 const (
-	keyHandleFormat     = 0x20
+	// Format 0x30 credential keys have an authorization value derived
+	// with the device key, sent to the TPM encrypted and only used in
+	// HMAC sessions. Without it, someone who recorded the bus of a
+	// discrete TPM (which shows the primary key template) could use a
+	// credential key without tpm-fido, even after a reset. Format 0x20
+	// keys don't have one; they are still accepted.
+	keyHandleFormat     = 0x30
+	keyHandleFormatV2   = 0x20
 	keyHandleFormatMask = 0xF0
 
 	// the credential was created with the hmac-secret extension
@@ -75,11 +83,17 @@ type KeyOptions struct {
 
 type keyHandleFlags struct {
 	legacy bool
+	// the credential key has an authorization value (format 0x30)
+	credAuth bool
+	format   byte
 	KeyOptions
 }
 
 func (f keyHandleFlags) versionByte() byte {
-	b := byte(keyHandleFormat)
+	b := f.format
+	if b == 0 {
+		b = keyHandleFormat
+	}
 	if f.HMACSecret {
 		b |= keyHandleFlagHMACSecret
 	}
@@ -101,8 +115,10 @@ func parseSeed(field []byte) (seed []byte, flags keyHandleFlags, err error) {
 	if len(field) == seedSizeBytes {
 		return field, keyHandleFlags{legacy: true}, nil
 	}
-	if len(field) == seedSizeBytes+1 && field[0]&keyHandleFormatMask == keyHandleFormat {
+	if len(field) == seedSizeBytes+1 && (field[0]&keyHandleFormatMask == keyHandleFormat || field[0]&keyHandleFormatMask == keyHandleFormatV2) {
 		v := field[0]
+		flags.format = v & keyHandleFormatMask
+		flags.credAuth = flags.format == keyHandleFormat
 		flags.HMACSecret = v&keyHandleFlagHMACSecret != 0
 		flags.Discoverable = v&keyHandleFlagDiscoverable != 0
 		switch v & (keyHandleFlagCredProtectList | keyHandleFlagCredProtectUV) {
@@ -207,6 +223,18 @@ func primaryTemplate(seed, applicationParam []byte, noDA bool) tpm2.TPMTPublic {
 
 // credentialTemplate is the template of a credential key. With a policy
 // digest, the key can only be used through a policy session.
+// credAuth returns the authorization value of a format 0x30 credential key.
+// The device key HMAC is received encrypted.
+func (t *TPM) credAuth(tpm transport.TPM, seed []byte, flags keyHandleFlags) ([]byte, error) {
+	msg := append([]byte("tpm-fido credential auth"), flags.versionByte())
+	mac, err := t.deviceHMAC(tpm, append(msg, seed...), true)
+	if err != nil {
+		return nil, err
+	}
+	// hex: no zero bytes, see derive
+	return []byte(hex.EncodeToString(mac[:16])), nil
+}
+
 func credentialTemplate(policy []byte) tpm2.TPMTPublic {
 	return tpm2.TPMTPublic{
 		Type:    tpm2.TPMAlgECC,
@@ -278,13 +306,26 @@ func parentAuth(p *tpm2.CreatePrimaryResponse) tpm2.AuthHandle {
 // RegisterKey creates a credential key for applicationParam (the rpIdHash)
 // and returns its key handle and public key.
 func (t *TPM) RegisterKey(applicationParam []byte, opts KeyOptions) ([]byte, *big.Int, *big.Int, error) {
+	return t.registerKey(applicationParam, keyHandleFlags{KeyOptions: opts, credAuth: true, format: keyHandleFormat})
+}
+
+// registerKey creates a credential key; tests use it to create format 0x20
+// key handles.
+func (t *TPM) registerKey(applicationParam []byte, flags keyHandleFlags) ([]byte, *big.Int, *big.Int, error) {
+	opts := flags.KeyOptions
 	var (
 		keyHandle []byte
 		x, y      *big.Int
 	)
 	err := t.withTPM(func(tpm transport.TPM) error {
-		flags := keyHandleFlags{KeyOptions: opts}
 		seed := mustRand(seedSizeBytes)
+		var auth []byte
+		if flags.credAuth {
+			var err error
+			if auth, err = t.credAuth(tpm, seed, flags); err != nil {
+				return err
+			}
+		}
 
 		var policy []byte
 		if opts.CredProtect == 3 {
@@ -307,10 +348,19 @@ func (t *TPM) RegisterKey(applicationParam []byte, opts KeyOptions) ([]byte, *bi
 		}
 		defer flush(tpm, primary.ObjectHandle)
 
+		// the authorization value is the first parameter, encrypted
+		sec, err := t.secure(tpm)
+		if err != nil {
+			return err
+		}
 		created, err := tpm2.Create{
 			ParentHandle: parentAuth(primary),
-			InPublic:     tpm2.New2B(credentialTemplate(policy)),
-		}.Execute(tpm)
+			InSensitive: tpm2.TPM2BSensitiveCreate{
+				Sensitive: &tpm2.TPMSSensitiveCreate{UserAuth: tpm2.TPM2BAuth{Buffer: auth}},
+			},
+			InPublic: tpm2.New2B(credentialTemplate(policy)),
+		}.Execute(tpm, sec.encrypt(encryptIn))
+		sec.close()
 		if err != nil {
 			return fmt.Errorf("create credential key err: %w", err)
 		}
@@ -399,6 +449,23 @@ func (t *TPM) SignASN1(keyHandle, applicationParam, digest, uvPinHash []byte) ([
 		// Satisfy the policy before loading the credential key, so that
 		// no more than three objects are loaded at a time.
 		var auth tpm2.Session = tpm2.PasswordAuth(nil)
+		if flags.credAuth && flags.CredProtect != 3 {
+			_, _, seedField, err := decodeKeyHandle(keyHandle)
+			if err != nil {
+				return err
+			}
+			seed, _, err := parseSeed(seedField)
+			if err != nil {
+				return err
+			}
+			value, err := t.credAuth(tpm, seed, flags)
+			if err != nil {
+				return err
+			}
+			// an HMAC session proves knowledge of the value without
+			// sending it
+			auth = tpm2.HMAC(tpm2.TPMAlgSHA256, 16, tpm2.Auth(value))
+		}
 		if flags.CredProtect == 3 {
 			if uvPinHash == nil {
 				return ErrPINRequired

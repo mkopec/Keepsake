@@ -54,6 +54,7 @@ func (s *server) setupDesktop() error {
 		confirmer = pinentry.New()
 	}
 	s.pe = ui.New(confirmer)
+	s.pe.Allow = s.dialogs.allow
 
 	if *askpassServiceFlag && connErr == nil {
 		if err := s.exportAskpassService(conn); err != nil {
@@ -73,6 +74,15 @@ func (s *server) setupDesktop() error {
 
 var lockErrOnce sync.Once
 
+// logName returns a relying party ID or user name for the log: they are
+// only logged with -verbose, since the journal is kept for a long time.
+func logName(name string) string {
+	if *verbose {
+		return name
+	}
+	return "(hidden)"
+}
+
 // sessionLocked reports whether requests must be refused because the
 // session is locked. If the lock state is unknown, requests are allowed:
 // the check only avoids prompts nobody can answer and requests while the
@@ -85,11 +95,19 @@ func (s *server) sessionLocked(ctx context.Context) bool {
 	defer cancel()
 	locked, err := s.locker.Locked(ctx)
 	if err != nil {
+		// Fail closed once the lock state could be read: an error then
+		// may mean something interferes with the check. If it never
+		// could (no logind, no GNOME), allow requests.
+		if s.lockKnown.Load() {
+			log.Printf("can't tell whether the session is locked, refusing request: %s", err)
+			return true
+		}
 		lockErrOnce.Do(func() {
 			log.Printf("can't tell whether the session is locked, allowing requests: %s", err)
 		})
 		return false
 	}
+	s.lockKnown.Store(true)
 	if locked {
 		log.Print("session is locked or inactive, refusing request")
 	}

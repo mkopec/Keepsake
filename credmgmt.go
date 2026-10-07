@@ -11,16 +11,23 @@ import (
 
 // credMgmtState holds the remaining items of an enumeration.
 type credMgmtState struct {
-	rps   []ctap2.RelyingParty
-	creds []passkeys.Credential
+	// the CTAPHID channel that started the enumeration
+	chanID uint32
+	rps    []ctap2.RelyingParty
+	creds  []passkeys.Credential
 }
 
-func (s *server) credentialManagement(req *ctap2.CredMgmtReq) (interface{}, error) {
+func (s *server) credentialManagement(chanID uint32, req *ctap2.CredMgmtReq) (interface{}, error) {
 	log.Printf("got ctap2 CredentialManagement subcommand=0x%02x", req.SubCommand)
 
 	// Only the *Next subcommands continue an enumeration.
 	state := s.credMgmt
-	s.credMgmt = nil
+	if state != nil && state.chanID != chanID {
+		// another channel's enumeration: leave it alone
+		state = nil
+	} else {
+		s.credMgmt = nil
+	}
 
 	switch req.SubCommand {
 	case ctap2.CredMgmtEnumerateRPsNext:
@@ -86,7 +93,7 @@ func (s *server) credentialManagement(req *ctap2.CredMgmtReq) (interface{}, erro
 		if len(rps) == 0 {
 			return nil, ctap2.ErrNoCredentials
 		}
-		s.credMgmt = &credMgmtState{rps: rps[1:]}
+		s.credMgmt = &credMgmtState{chanID: chanID, rps: rps[1:]}
 		h := sha256.Sum256([]byte(rps[0].ID))
 		return ctap2.CredMgmtResp{RP: &rps[0], RPIDHash: h[:], TotalRPs: len(rps)}, nil
 
@@ -104,7 +111,7 @@ func (s *server) credentialManagement(req *ctap2.CredMgmtReq) (interface{}, erro
 		if len(matching) == 0 {
 			return nil, ctap2.ErrNoCredentials
 		}
-		s.credMgmt = &credMgmtState{creds: matching[1:]}
+		s.credMgmt = &credMgmtState{chanID: chanID, creds: matching[1:]}
 		resp := credMgmtCredential(&matching[0])
 		resp.TotalCredentials = len(matching)
 		return resp, nil
@@ -128,7 +135,7 @@ func (s *server) credentialManagement(req *ctap2.CredMgmtReq) (interface{}, erro
 		if deleted == nil {
 			return nil, ctap2.ErrNoCredentials
 		}
-		log.Printf("deleting passkey rp=%s user=%s", deleted.RPID, deleted.UserName)
+		log.Printf("deleting passkey rp=%s user=%s", logName(deleted.RPID), logName(deleted.UserName))
 		if err := s.passkeys.Save(kept); err != nil {
 			return nil, err
 		}

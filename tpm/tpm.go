@@ -35,12 +35,18 @@ type Handles struct {
 	PINIndex     uint32
 	StateIndex   uint32
 	DeviceKey    uint32
+	// StoreCounter is the passkey store's anti-rollback counter
+	StoreCounter uint32
 	// SRKNameFile pins the name of the TPM's storage root key, see
 	// secure.go. Empty disables pinning.
 	SRKNameFile string
 	// UserSecretFile holds the user secret, see user.go. It is created if
 	// it doesn't exist.
 	UserSecretFile string
+	// BindBootState binds a newly created device key to PCR 7, so the
+	// credentials can only be used after the same Secure Boot state.
+	// An existing device key is unaffected until a reset.
+	BindBootState bool
 }
 
 // SharedHandles are the handles development versions before per-user
@@ -88,6 +94,16 @@ type TPM struct {
 	// set by New
 	userSecret []byte
 
+	storeCounter uint32
+	// storeCounterNew is set if New created the store counter
+	storeCounterNew bool
+
+	bindBootState  bool
+	deviceKeyBound bool
+	// bootStateChanged is set if the device key couldn't be used at
+	// startup because PCR 7 changed
+	bootStateChanged bool
+
 	// dial replaces opening devicePath in tests
 	dial func() (io.ReadWriteCloser, error)
 }
@@ -121,6 +137,8 @@ func newTPM(devicePath string, h Handles, dial func() (io.ReadWriteCloser, error
 		return nil, fmt.Errorf("user secret: %w", err)
 	}
 	t.userSecret = secret
+	t.bindBootState = h.BindBootState
+	t.storeCounter = h.StoreCounter
 
 	tpm, err := t.open()
 	if err != nil {
@@ -137,6 +155,11 @@ func newTPM(devicePath string, h Handles, dial func() (io.ReadWriteCloser, error
 	}
 	if err := t.ensureDeviceKey(tr); err != nil {
 		return nil, err
+	}
+	if t.storeCounter != 0 {
+		if t.storeCounterNew, err = t.ensureStoreCounter(tr); err != nil {
+			return nil, err
+		}
 	}
 	state, err := t.readState(tr)
 	if err != nil {
@@ -197,4 +220,12 @@ func mustRand(size int) []byte {
 	}
 
 	return b
+}
+
+// DeviceKeyBound reports whether the device key is bound to the boot
+// state, and whether the boot state changed since it was created.
+func (t *TPM) DeviceKeyBound() (bound, changed bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.deviceKeyBound, t.bootStateChanged
 }

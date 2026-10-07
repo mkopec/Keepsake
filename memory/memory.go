@@ -19,6 +19,7 @@ type Mem struct {
 	signCounter      uint32
 	pinHash          []byte
 	pinRetries       int
+	storeVersion     uint64
 }
 
 func New() (*Mem, error) {
@@ -215,5 +216,17 @@ func (m *Mem) Reset() error {
 	m.masterPrivateKey = mustRand(chacha20poly1305.KeySize)
 	m.pinHash = nil
 	m.pinRetries = 0
+	return nil
+}
+
+func (m *Mem) StoreVersion() (uint64, error) {
+	return m.storeVersion, nil
+}
+
+func (m *Mem) AdvanceStoreVersion(v uint64) error {
+	if v != m.storeVersion+1 {
+		return fmt.Errorf("store counter is %d, can't advance it to %d", m.storeVersion, v)
+	}
+	m.storeVersion = v
 	return nil
 }

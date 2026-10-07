@@ -36,17 +36,25 @@ Discoverable credentials (passkeys) are credentials like any other, flagged as d
 
 A passkey can only be used while it is in the store, so deleting a passkey revokes it, even for a site that still knows its credential ID. Registering a new passkey for the same site and user replaces (and revokes) the old one. Up to 128 passkeys can be stored. If the store can't be decrypted (because the TPM was cleared, for example), it is moved aside to `passkeys.undecryptable-<time>` and a new one is started.
 
+The store records the value of a TPM counter that tpm-fido advances on every save, so an older copy of the store (e.g. restored from a backup) is detected, moved aside the same way and not used: it could bring back passkeys you deleted. Back up the store only to restore it after losing the newer one, and expect tpm-fido to refuse it.
+
 When a site asks for a passkey without user verification, only the user ID is returned; user names are only returned after the PIN was verified (CTAP 2.0).
 
 Passkeys can be listed and deleted with tools that support credential management, for example `fido2-token -L -r`, `fido2-token -L -k <rp id>` and `fido2-token -D -i <credential id>`, or Chrome's security key settings. These require the PIN.
 
 ### Reset
 
-`authenticatorReset` (for example `fido2-token -R`, or "Reset your security key" in Chrome) replaces the device key, disables legacy key handles, removes the PIN and deletes the passkey store. Every credential stops working, including hmac-secret secrets, so LUKS keys enrolled with tpm-fido are lost. Hardware authenticators only accept a reset shortly after being plugged in; tpm-fido instead asks for confirmation in the `pinentry` dialog.
+`authenticatorReset` (for example `fido2-token -R`, or "Reset your security key" in Chrome) replaces the device key, disables legacy key handles, removes the PIN and deletes the passkey store. Every credential stops working, including hmac-secret secrets, so LUKS keys enrolled with tpm-fido are lost. Hardware authenticators only accept a reset shortly after being plugged in; tpm-fido instead asks for confirmation in a dialog.
+
+### Boot state binding
+
+With `-bind-boot-state`, the device key created at the next reset (or first start) is bound to PCR 7, which records the Secure Boot state and the keys that verified the boot chain. Then credentials can only be used after a boot with the same Secure Boot configuration, which helps against someone who boots another OS on the machine to use them (see [Security](#security)). It only helps if PCR 7 differs for that OS: typically when you enroll your own Secure Boot keys (e.g. with sbctl) instead of using Microsoft's, and not at all with Secure Boot disabled.
+
+Changing the Secure Boot configuration (enrolling keys, updating dbx, some firmware updates) makes every credential unusable until it is restored; tpm-fido warns at startup. The only other way out is a reset, which loses all credentials, so keep another way to sign in.
 
 ### PIN
 
-The PIN is set, entered and changed by the platform (browser, `fido2-token -S`, ...), as with a hardware security key. Once a PIN is set, every registration requires it (CTAP 2.0); sign-ins require it when the site asks for user verification.
+The PIN is set, entered and changed by the platform (browser, `fido2-token -S`, ...), as with a hardware security key. Once a PIN is set, every registration requires it (CTAP 2.0); sign-ins require it when the site asks for user verification. U2F can't ask for a PIN, so U2F registrations are refused once a PIN is set (browsers use CTAP2; U2F sign-ins with existing credentials keep working). A verified PIN is valid for one minute; then tpm-fido wipes the PIN hash from memory.
 
 The PIN is stored in the TPM in your slot's PIN index (see [TPM objects](#tpm-objects)):
 
@@ -74,7 +82,13 @@ Request it with `fido2-cred -M -c 3`, the `credentialProtectionPolicy: "userVeri
 
 ### Bus encryption
 
-Commands that carry secrets (PIN hashes, hmac-secret outputs, the passkey store key) use HMAC sessions salted with the TPM's storage root key, with parameter encryption, so someone recording the bus of a discrete TPM sees neither the PIN hash nor anything to brute force it from, nor the hmac-secret outputs. To protect against an active interposer, the storage root key's name is pinned on first use in `srk-name` next to the passkey store; if it changes, tpm-fido refuses to start. (It also changes when the TPM is cleared, which destroys all tpm-fido credentials anyway; delete the file then.) Signatures and credential IDs aren't secret and aren't encrypted.
+Someone with physical access can record the bus between the CPU and a discrete TPM chip (firmware TPMs, e.g. Intel PTT or AMD fTPM, have no such bus). tpm-fido limits what such a recording is good for:
+
+* PIN hashes, hmac-secret outputs, the passkey store key and the authorization values of the device key and credential keys only cross the bus encrypted, in HMAC sessions salted with the TPM's storage root key, or not at all (an HMAC session proves knowledge of a value without sending it).
+* The recording does show the template of each credential's parent key, so the recorder can load the credential key into the TPM later, but signing needs the credential key's authorization value. Credential IDs created by development versions before credential keys had one (format `0x20`) can be used with a recording; register them again to replace them.
+* Signatures and credential IDs aren't secret and aren't encrypted.
+
+To protect against an active interposer, the storage root key's name is pinned on first use in `srk-name` next to the passkey store; if it changes, tpm-fido refuses to start. (It also changes when the TPM is cleared, which destroys all tpm-fido credentials anyway; delete the file then.) An interposer present the first time tpm-fido runs isn't detected.
 
 ### hmac-secret
 
@@ -99,6 +113,20 @@ The signature counter is a TPM NV counter in your slot. tpm-fido defines the ind
 
 Older versions of tpm-fido reported the number of seconds since 2021-01-01 as the counter. The NV counter value is offset by `0x10000000` so it stays above any of those values.
 
+## Security
+
+tpm-fido protects against copying the credentials: the private keys never leave the TPM, and credential IDs and the passkey store are useless without this TPM and your user secret. It also limits PIN guessing with the TPM's dictionary attack protection, binds `credProtect` level 3 credentials to the PIN in the TPM, keeps other users of the TPM away from your credentials, and protects secrets on the bus of a discrete TPM.
+
+It doesn't protect against:
+
+* **Programs that can open the security key device.** The device node (`/dev/hidrawN`) is the boundary: any program that can open it can make requests, as with a USB security key, and sees every response. On most systems only the logged in user can open it (`uaccess`), but check for udev rules that make all hidraw devices world-writable (`MODE="0666"`).
+* **Malware running as you.** It can read your user secret and use credentials (except level 3 ones, without the PIN) directly through the TPM, while it runs; it can't copy the private keys. On X11 it can also click dialogs.
+* **Someone booting another OS on the machine** while your home directory isn't encrypted: they can read the user secret and use the credentials the same way. Use full disk encryption; `-bind-boot-state` can help (see [Boot state binding](#boot-state-binding)).
+* **Unlimited PIN guessing and clearing the TPM**, if the TPM's lockout authorization is empty (tpm-fido warns at startup): anyone who can use the TPM can reset its dictionary attack counter, or clear the TPM, destroying all its keys. Set it with `tpm2_changeauth -c lockout <password>`.
+* **Other users of the TPM deleting your TPM objects**, which destroys your credentials (but doesn't give access to them).
+
+By default the log doesn't contain relying party IDs or user names (`-verbose` adds them).
+
 ## Status
 
 tpm-fido has been tested to work with Chrome and Firefox on Linux.
@@ -122,7 +150,18 @@ tpm-fido only accepts answers from the connection that owns the prompter's bus n
 
 While the session is locked or inactive (another user's session is in the foreground), tpm-fido refuses every request except `authenticatorGetInfo`: nobody can confirm them, and requests that don't need confirmation (`up=false` sign-ins, which can also return hmac-secret secrets) shouldn't succeed while you are away. A dialog that is open when the screen locks is closed and its request refused. U2F requests are answered like a key waiting for a touch, so the browser keeps waiting.
 
-tpm-fido asks logind (`LockedHint` and `Active` of the user's session) and GNOME Shell's screen shield (`org.gnome.ScreenSaver`). If neither can be asked, requests are allowed. Disable the check with `-lock-check=false`.
+tpm-fido asks logind (`LockedHint` and `Active` of the user's session) and GNOME Shell's screen shield (`org.gnome.ScreenSaver`). If neither could ever be asked (no logind, no GNOME), requests are allowed; if they could be asked before and stop answering, requests are refused. Disable the check with `-lock-check=false`.
+
+### Requests without a dialog
+
+Physical security keys can sign without a touch when asked to (`up=false`), because unplugging them stops all use. tpm-fido is never unplugged, so by default:
+
+* sign-ins without user presence still return a signature, with the "user present" flag clear (relying parties following WebAuthn, and sshd unless the key was created with `no-touch-required`, reject it), but **no hmac-secret output**;
+* U2F signatures without user presence are refused.
+
+Tools that derive keys without a touch need `-allow-silent`, e.g. LUKS enrolled with `systemd-cryptenroll --fido2-with-user-presence=no`. Anyone who can open the security key device and knows the credential ID (it is in the LUKS header) can then get the secret while tpm-fido runs.
+
+tpm-fido shows at most 6 dialogs within 30 seconds (`-dialog-limit`), so a program can't flood the screen with them; further requests are refused without a dialog. Setting the first PIN also asks for confirmation, so a program can't set a PIN you don't know.
 
 ### systemd user service
 
@@ -141,7 +180,7 @@ make install
 make enable-gnome-ssh   # adds a drop-in to gcr-ssh-agent.service and restarts it
 ```
 
-* **Security key PINs:** if tpm-fido runs, tpm-fido-askpass asks it for the PIN over D-Bus (`io.github.psanford.TpmFido`), and tpm-fido shows a single "Sign In with SSH Key?" prompt. Typing the PIN into a prompt tpm-fido showed proves that you are present, so the signature that follows doesn't show tpm-fido's confirmation dialog: one prompt instead of two. This presence grant is used once, expires after 15 seconds, and only applies to a request whose verified PIN is the one you typed. Other programs can ask tpm-fido to show the prompt (as they could show any prompt), but can't answer it. Without tpm-fido (e.g. for a hardware key), it asks with the GNOME system prompt; the PIN travels from the prompt encrypted with gcr's secret exchange. Disable the combined prompt with `tpm-fido -askpass-service=false`.
+* **Security key PINs:** if tpm-fido runs, tpm-fido-askpass asks it for the PIN over D-Bus (`io.github.psanford.TpmFido`), and tpm-fido shows a single "Sign In with SSH Key?" prompt. Typing the PIN into a prompt tpm-fido showed proves that you are present, so the signature that follows doesn't show tpm-fido's confirmation dialog: one prompt instead of two. This presence grant is used once, expires after 15 seconds, only applies to SSH (relying party IDs starting with `ssh:`) and to a request whose verified PIN is the one you typed. Other programs can ask tpm-fido to show the prompt (as they could show any prompt), but can't answer it. tpm-fido-askpass only talks to tpm-fido if its D-Bus name belongs to the `tpm-fido` binary installed next to it (`$TPMFIDO_PATH` overrides the path), so another program claiming the name while tpm-fido isn't running doesn't get the PIN. Without tpm-fido (e.g. for a hardware key), it asks with the GNOME system prompt; the PIN travels from the prompt encrypted with gcr's secret exchange. Disable the combined prompt with `tpm-fido -askpass-service=false`.
 * **Key passphrases and `ssh-add -c` confirmations:** GNOME system prompt. gcr-ssh-agent's own passphrase prompts for keys in `~/.ssh` (with "remember in keyring") are unaffected: gcr runs `ssh-add` with its own askpass.
 * **"Touch your security key":** a desktop notification, unless tpm-fido handles the request (it shows its own dialog).
 * Without a GNOME system prompter it runs `$TPMFIDO_ASKPASS_FALLBACK` or OpenSSH's `ssh-askpass`.
@@ -189,9 +228,10 @@ tpm-fido creates these TPM objects, which requires the owner hierarchy to have a
 | `0x01300000 + 4s` | signature counter | on first start |
 | `0x01300000 + 4s + 1` | PIN and UV key | when a PIN is set |
 | `0x01300000 + 4s + 2` | state flags | on the first reset |
+| `0x01300000 + 4s + 3` | passkey store counter | on first start |
 | `0x81300000 + s` | device key (persistent) | on first start |
 
-For user ID 1000: `0x01300FA0`–`0x01300FA2` and `0x813003E8`. Development versions used fixed handles (`0x0100F1D0`–`0x0100F1D2`, `0x8100F1D0`) for everyone; tpm-fido mentions them at startup if they are still there.
+For user ID 1000: `0x01300FA0`–`0x01300FA3` and `0x813003E8`. Development versions used fixed handles (`0x0100F1D0`–`0x0100F1D2`, `0x8100F1D0`) for everyone; tpm-fido mentions them at startup if they are still there.
 
 ## Dependencies
 

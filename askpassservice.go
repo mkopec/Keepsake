@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +28,10 @@ import (
 // receive it, but it could equally show its own (or the system prompter's)
 // PIN prompt. A program that already knows the PIN and races the user's
 // request uses up the grant, and the user's request shows the usual dialog.
+//
+// The prompt only asks for a PIN for SSH, so the grant only applies to SSH
+// requests (relying party IDs starting with "ssh:"): a program can't use
+// the prompt to have the user unknowingly confirm a sign in to a website.
 const (
 	askpassBusName   = "io.github.psanford.TpmFido"
 	askpassPath      = "/io/github/psanford/TpmFido"
@@ -74,9 +79,10 @@ func (a askpassService) AskPIN(message string) (string, *dbus.Error) {
 	if a.s.sessionLocked(ctx) {
 		return "", dbus.NewError(askpassInterface+".Locked", []interface{}{"session is locked"})
 	}
+
 	pin, err := a.s.pe.Password(ctx, sshPINPrompt(message))
 	switch {
-	case errors.Is(err, ui.ErrCancelled):
+	case errors.Is(err, ui.ErrCancelled), errors.Is(err, ui.ErrRateLimited):
 		return "", dbus.NewError(askpassInterface+".Cancelled", []interface{}{"cancelled"})
 	case err != nil:
 		return "", dbus.MakeFailedError(err)
@@ -115,9 +121,9 @@ func (s *server) noteRequest() {
 }
 
 // usePresenceGrant reports whether the presence of the user was proven by
-// typing the PIN of this user verified request into tpm-fido's prompt.
-func (s *server) usePresenceGrant(uv bool) bool {
-	if !uv || !s.grant.consume(s.pin.pinHash) {
+// typing the PIN of this user verified SSH request into tpm-fido's prompt.
+func (s *server) usePresenceGrant(uv bool, rpID string) bool {
+	if !uv || !strings.HasPrefix(rpID, "ssh:") || !s.grant.consume(s.pin.pinHash) {
 		return false
 	}
 	log.Print("user presence confirmed by the PIN prompt")

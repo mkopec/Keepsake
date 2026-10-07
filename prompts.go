@@ -101,6 +101,14 @@ func sshKeyFingerprint(message string) string {
 	return ""
 }
 
+func setPINPrompt() ui.Prompt {
+	return ui.Prompt{
+		Heading: "Set Security Key PIN?",
+		Body:    "A website or app wants to set the PIN of the security key in this computer. Websites will be able to ask for it to verify it’s you.",
+		OK:      "Set PIN",
+	}
+}
+
 func resetPrompt() ui.Prompt {
 	return ui.Prompt{
 		Heading: "Reset Security Key?",

@@ -96,3 +96,19 @@ func TestConfirmPresenceAbandoned(t *testing.T) {
 		t.Fatal("abandoned dialog wasn't closed")
 	}
 }
+
+func TestAllow(t *testing.T) {
+	p := New(&fakeConfirmer{answer: true})
+	allowed := false
+	p.Allow = func() bool { return allowed }
+	if _, err := p.Confirm(context.Background(), Prompt{}); err != ErrRateLimited {
+		t.Fatalf("confirm: %v", err)
+	}
+	if _, err := p.ConfirmPresence(Prompt{}, [32]byte{}, [32]byte{}); err != ErrRateLimited {
+		t.Fatalf("U2F: %v", err)
+	}
+	allowed = true
+	if ok, err := p.Confirm(context.Background(), Prompt{}); !ok || err != nil {
+		t.Fatalf("allowed: %v %v", ok, err)
+	}
+}

@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/fxamacker/cbor/v2"
 )
 
 func testStore(t *testing.T, key []byte) *Store {
@@ -87,5 +89,92 @@ func TestMaxCredentials(t *testing.T) {
 	s := testStore(t, bytes.Repeat([]byte{1}, 32))
 	if err := s.Save(make([]Credential, MaxCredentials+1)); err == nil {
 		t.Fatal("saved too many credentials")
+	}
+}
+
+type counter struct{ v uint64 }
+
+func (c *counter) store(t *testing.T, path string) *Store {
+	return &Store{
+		Path:    path,
+		Key:     func() ([]byte, error) { return bytes.Repeat([]byte{1}, 32), nil },
+		Version: func() (uint64, error) { return c.v, nil },
+		Advance: func(v uint64) error {
+			if v != c.v+1 {
+				t.Fatalf("advance %d -> %d", c.v, v)
+			}
+			c.v = v
+			return nil
+		},
+	}
+}
+
+func TestRollback(t *testing.T) {
+	c := &counter{v: 41}
+	path := filepath.Join(t.TempDir(), "passkeys")
+	s := c.store(t, path)
+
+	if err := s.Save([]Credential{{ID: []byte{1}}}); err != nil {
+		t.Fatal(err)
+	}
+	old, _ := os.ReadFile(path)
+	if err := s.Save([]Credential{{ID: []byte{1}}, {ID: []byte{2}}}); err != nil {
+		t.Fatal(err)
+	}
+	if c.v != 43 {
+		t.Fatalf("counter %d", c.v)
+	}
+	if creds, err := s.Load(); err != nil || len(creds) != 2 {
+		t.Fatalf("load: %v %v", creds, err)
+	}
+
+	// restoring the older copy is detected
+	os.WriteFile(path, old, 0600)
+	if _, err := s.Load(); err != ErrRolledBack {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	// tampering with the version breaks authentication
+	cur, _ := os.ReadFile(path)
+	cur[len(headerV2)+7]++
+	os.WriteFile(path, cur, 0600)
+	if _, err := s.Load(); err != ErrUndecryptable {
+		t.Fatalf("modified version: %v", err)
+	}
+}
+
+func TestCrashBeforeAdvance(t *testing.T) {
+	c := &counter{v: 5}
+	path := filepath.Join(t.TempDir(), "passkeys")
+	s := c.store(t, path)
+	if err := s.Save([]Credential{{ID: []byte{1}}}); err != nil {
+		t.Fatal(err)
+	}
+	// simulate a crash after writing the store and before advancing
+	c.v--
+	if creds, err := s.Load(); err != nil || len(creds) != 1 || c.v != 6 {
+		t.Fatalf("load after crash: %v %v counter %d", creds, err, c.v)
+	}
+}
+
+func TestUnversionedMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "passkeys")
+	plain := &Store{Path: path, Key: func() ([]byte, error) { return bytes.Repeat([]byte{1}, 32), nil }}
+	// write a v1 store by hand
+	aead, _ := plain.aead()
+	nonce := make([]byte, aead.NonceSize())
+	pt, _ := cbor.Marshal([]Credential{{ID: []byte{7}}})
+	data := append(append([]byte(nil), headerV1...), nonce...)
+	os.WriteFile(path, aead.Seal(data, nonce, pt, headerV1), 0600)
+
+	c := &counter{v: 1}
+	s := c.store(t, path)
+	if _, err := s.Load(); err != ErrRolledBack {
+		t.Fatalf("v1 store accepted without AllowUnversioned: %v", err)
+	}
+	s.AllowUnversioned = true
+	creds, err := s.Load()
+	if err != nil || len(creds) != 1 {
+		t.Fatalf("migration load: %v %v", creds, err)
 	}
 }

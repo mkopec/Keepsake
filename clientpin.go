@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"log"
+	"time"
 	"unicode/utf8"
 
 	"github.com/psanford/tpm-fido/ctap2"
+	"github.com/psanford/tpm-fido/fidohid"
 	"github.com/psanford/tpm-fido/tpm"
 )
 
@@ -19,6 +21,11 @@ const (
 	maxConsecutivePINFailures = 3
 	minPINLength              = 4
 	paddedPINLength           = 64
+
+	// pinTokenLifetime is how long a pinToken (and the PIN hash it was
+	// issued for, which the TPM needs for PIN-bound credentials) stays
+	// valid. Platforms use the token right after getting it.
+	pinTokenLifetime = time.Minute
 )
 
 // PINStore persists the clientPIN state. pinHash is LEFT(SHA-256(PIN), 16).
@@ -41,7 +48,16 @@ type pinState struct {
 	// pinHash is the hash of the PIN that pinToken was issued for. It is
 	// needed to use the TPM's UV key for hmac-secret.
 	pinHash             []byte
+	tokenExpires        time.Time
 	consecutiveFailures int
+}
+
+// expire invalidates the pinToken and wipes the PIN hash once they expired.
+// It must run on the request goroutine.
+func (ps *pinState) expire() {
+	if ps.pinHash != nil && time.Now().After(ps.tokenExpires) {
+		ps.regeneratePINToken()
+	}
 }
 
 func newPINState() *pinState {
@@ -60,11 +76,13 @@ func (ps *pinState) regenerateKeyAgreement() {
 }
 
 func (ps *pinState) regeneratePINToken() {
+	clear(ps.pinToken)
+	clear(ps.pinHash)
 	ps.pinToken = mustRand(32)
 	ps.pinHash = nil
 }
 
-func (s *server) clientPIN(req *ctap2.ClientPINReq) (interface{}, error) {
+func (s *server) clientPIN(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.ClientPINReq) (interface{}, error) {
 	if req.SubCommand == 0 {
 		return nil, ctap2.ErrMissingParameter
 	}
@@ -96,7 +114,7 @@ func (s *server) clientPIN(req *ctap2.ClientPINReq) (interface{}, error) {
 			KeyAgreement: ctap2.KeyAgreementCOSEKey(s.pin.keyAgreement.PublicKey()),
 		}, nil
 	case ctap2.PINSetPIN:
-		return nil, s.setPIN(proto, req)
+		return nil, s.setPIN(evt, ka, proto, req)
 	case ctap2.PINChangePIN:
 		return nil, s.changePIN(proto, req)
 	case ctap2.PINGetPINToken:
@@ -118,7 +136,7 @@ func (s *server) sharedSecret(proto ctap2.PINProtocol, platformKey *ctap2.COSEKe
 	return proto.SharedSecret(z), nil
 }
 
-func (s *server) setPIN(proto ctap2.PINProtocol, req *ctap2.ClientPINReq) error {
+func (s *server) setPIN(evt fidohid.AuthEvent, ka *keepalive, proto ctap2.PINProtocol, req *ctap2.ClientPINReq) error {
 	if req.KeyAgreement == nil || req.PinAuth == nil || req.NewPinEnc == nil {
 		return ctap2.ErrMissingParameter
 	}
@@ -139,6 +157,13 @@ func (s *server) setPIN(proto ctap2.PINProtocol, req *ctap2.ClientPINReq) error 
 	}
 	pinHash, err := decryptNewPIN(proto, shared, req.NewPinEnc)
 	if err != nil {
+		return err
+	}
+
+	// CTAP doesn't need user presence to set the first PIN, but tpm-fido
+	// is never unplugged: without it, any program that can open the
+	// device could set a PIN the user doesn't know.
+	if err := s.confirmPresence(evt, ka, setPINPrompt()); err != nil {
 		return err
 	}
 
@@ -210,6 +235,7 @@ func (s *server) getPINToken(proto ctap2.PINProtocol, req *ctap2.ClientPINReq) (
 
 	s.pin.regeneratePINToken()
 	s.pin.pinHash = pinHash
+	s.pin.tokenExpires = time.Now().Add(pinTokenLifetime)
 	return ctap2.ClientPINResp{PinToken: proto.Encrypt(shared, s.pin.pinToken)}, nil
 }
 

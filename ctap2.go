@@ -52,13 +52,17 @@ func (s *server) handleCBOR(token *fidohid.SoftToken, evt fidohid.AuthEvent) {
 
 func (s *server) dispatchCBOR(evt fidohid.AuthEvent, ka *keepalive) (interface{}, error) {
 	cmd, params := evt.CBOR[0], evt.CBOR[1:]
+	s.pin.expire()
 
-	// GetNextAssertion must directly follow GetAssertion
-	if cmd != ctap2.CmdGetNextAssertion {
+	// GetNextAssertion must directly follow GetAssertion, and credential
+	// management enumerations must not be interrupted either, on the same
+	// channel. Commands from other channels (other programs) don't affect
+	// them.
+	ch := evt.ChannelID()
+	if cmd != ctap2.CmdGetNextAssertion && s.nextAssertion != nil && s.nextAssertion.chanID == ch {
 		s.nextAssertion = nil
 	}
-	// credential management enumerations must not be interrupted either
-	if cmd != ctap2.CmdCredentialMgmt && cmd != ctap2.CmdCredentialMgmtPreview {
+	if cmd != ctap2.CmdCredentialMgmt && cmd != ctap2.CmdCredentialMgmtPreview && s.credMgmt != nil && s.credMgmt.chanID == ch {
 		s.credMgmt = nil
 	}
 
@@ -99,7 +103,7 @@ func (s *server) dispatchCBOR(evt fidohid.AuthEvent, ka *keepalive) (interface{}
 		if err := ctap2.Unmarshal(params, &req); err != nil {
 			return nil, err
 		}
-		return s.clientPIN(&req)
+		return s.clientPIN(evt, ka, &req)
 	case ctap2.CmdMakeCredential:
 		s.noteRequest()
 		var req ctap2.MakeCredentialReq
@@ -119,12 +123,12 @@ func (s *server) dispatchCBOR(evt fidohid.AuthEvent, ka *keepalive) (interface{}
 		if err := ctap2.Unmarshal(params, &req); err != nil {
 			return nil, err
 		}
-		return s.credentialManagement(&req)
+		return s.credentialManagement(evt.ChannelID(), &req)
 	case ctap2.CmdReset:
 		return s.reset(evt, ka)
 	case ctap2.CmdGetNextAssertion:
 		log.Print("got ctap2 GetNextAssertion")
-		return s.getNextAssertion()
+		return s.getNextAssertion(evt.ChannelID())
 	default:
 		log.Printf("unsupported ctap2 command 0x%02x", cmd)
 		return nil, ctap2.ErrInvalidCommand
@@ -136,7 +140,7 @@ func (s *server) makeCredential(evt fidohid.AuthEvent, ka *keepalive, req *ctap2
 		return nil, ctap2.ErrMissingParameter
 	}
 
-	log.Printf("got ctap2 MakeCredential rp=%s", req.RP.ID)
+	log.Printf("got ctap2 MakeCredential rp=%s", logName(req.RP.ID))
 
 	if err := s.selectAuthenticator(evt, ka, req.PinUvAuthParam); err != nil {
 		return nil, err
@@ -276,7 +280,7 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 		return nil, ctap2.ErrMissingParameter
 	}
 
-	log.Printf("got ctap2 GetAssertion rp=%s allowList=%d", req.RPID, len(req.AllowList))
+	log.Printf("got ctap2 GetAssertion rp=%s allowList=%d", logName(req.RPID), len(req.AllowList))
 
 	if err := s.selectAuthenticator(evt, ka, req.PinUvAuthParam); err != nil {
 		return nil, err
@@ -300,6 +304,13 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 	hmacReq, err := s.parseHMACSecretGet(req.Extensions)
 	if err != nil {
 		return nil, err
+	}
+	// Without user presence, anyone who can open the device and knows the
+	// credential ID (which isn't secret, e.g. it is in the LUKS header)
+	// could get the secret, as long as tpm-fido runs.
+	if hmacReq != nil && !up && !*allowSilent {
+		log.Print("hmac-secret without user presence refused (see -allow-silent)")
+		hmacReq = nil
 	}
 
 	rpIDHash := sha256.Sum256([]byte(req.RPID))
@@ -330,7 +341,7 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 
 	var flags byte
 	if up {
-		if !s.usePresenceGrant(uv) {
+		if !s.usePresenceGrant(uv, req.RPID) {
 			if err := s.confirmPresence(evt, ka, signInPrompt(displayText(req.RPID, 253))); err != nil {
 				return nil, err
 			}
@@ -353,6 +364,7 @@ func (s *server) getAssertion(evt fidohid.AuthEvent, ka *keepalive, req *ctap2.G
 			// assertions with GetNextAssertion.
 			resp.NumberOfCredentials = len(discovered)
 			s.nextAssertion = &assertionState{
+				chanID:         evt.ChannelID(),
 				creds:          discovered[1:],
 				rpIDHash:       rpIDHash[:],
 				clientDataHash: req.ClientDataHash,

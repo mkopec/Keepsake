@@ -51,6 +51,7 @@ func HandlesForSlot(slot int) Handles {
 		CounterIndex: nvSlotBase + uint32(slot)*4,
 		PINIndex:     nvSlotBase + uint32(slot)*4 + 1,
 		StateIndex:   nvSlotBase + uint32(slot)*4 + 2,
+		StoreCounter: nvSlotBase + uint32(slot)*4 + 3,
 		DeviceKey:    persistentSlotBase + uint32(slot),
 	}
 }
@@ -125,6 +126,12 @@ func (t *TPM) pinAuth(pinHash []byte) []byte {
 // the user secret file was replaced.
 func (t *TPM) checkDeviceKeyOwner(tpm transport.TPM) error {
 	_, err := t.deviceHMAC(tpm, []byte("tpm-fido owner check"), false)
+	if errors.Is(err, ErrBootStateChanged) {
+		// keep running: a reset (which doesn't use the device key)
+		// must remain possible
+		t.bootStateChanged = true
+		return nil
+	}
 	if errors.Is(err, tpm2.TPMRCAuthFail) || errors.Is(err, tpm2.TPMRCBadAuth) {
 		return fmt.Errorf("the device key at persistent handle 0x%08x doesn't belong to this user secret: "+
 			"either another user uses the same slot (choose another with -slot), or the user secret file was "+

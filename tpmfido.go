@@ -33,6 +33,9 @@ import (
 var backend = flag.String("backend", "tpm", "tpm|memory")
 var device = flag.String("device", "/dev/tpmrm0", "TPM device path")
 var slot = flag.Int("slot", -1, "TPM handle slot (0-65535), default: the user ID. Each user of the TPM needs their own")
+var bindBootState = flag.Bool("bind-boot-state", false, "bind credentials created after the next reset to the boot state (PCR 7, the Secure Boot configuration); see the README")
+var allowSilent = flag.Bool("allow-silent", false, "allow hmac-secret outputs and U2F signatures without user presence (e.g. LUKS enrolled with --fido2-with-user-presence=no)")
+var verbose = flag.Bool("verbose", false, "log relying party IDs and user names")
 var passkeyStore = flag.String("passkey-store", "", "passkey store path (default $XDG_DATA_HOME/tpm-fido/passkeys)")
 
 func main() {
@@ -57,9 +60,14 @@ type server struct {
 	nextAssertion *assertionState
 	credMgmt      *credMgmtState
 
+	dialogs dialogLimiter
+
 	// see askpassservice.go
 	grant       presenceGrant
 	lastRequest atomic.Int64
+
+	// lockKnown is set once the screen lock state could be read
+	lockKnown atomic.Bool
 }
 
 type Signer interface {
@@ -79,6 +87,10 @@ type Signer interface {
 	HMACSecret(keyHandle, rpIDHash, uvPinHash []byte) ([]byte, error)
 	// StoreKey returns the passkey store encryption key.
 	StoreKey() ([]byte, error)
+	// StoreVersion and AdvanceStoreVersion are the passkey store's
+	// anti-rollback counter, see passkeys.Store.
+	StoreVersion() (uint64, error)
+	AdvanceStoreVersion(v uint64) error
 	// Reset invalidates every credential and removes the PIN.
 	Reset() error
 }
@@ -113,6 +125,7 @@ func newServer() *server {
 		handles := tpm.HandlesForSlot(*slot)
 		handles.SRKNameFile = filepath.Join(filepath.Dir(path), "srk-name")
 		handles.UserSecretFile = filepath.Join(filepath.Dir(path), "user-secret")
+		handles.BindBootState = *bindBootState
 		signer, err := tpm.New(*device, handles)
 		if errors.Is(err, fs.ErrPermission) {
 			log.Fatalf("%s: add your user to the group owning %s (usually tss) and log in again", err, *device)
@@ -121,6 +134,14 @@ func newServer() *server {
 			log.Fatalf("TPM: %s", err)
 		}
 		warnLockout(signer)
+		switch bound, changed := signer.DeviceKeyBound(); {
+		case changed:
+			log.Printf("WARNING: %s. Until then, no credential can be used.", tpm.ErrBootStateChanged)
+		case *bindBootState && !bound:
+			log.Printf("note: -bind-boot-state only applies to a new device key: reset the security key to bind the credentials to the boot state")
+		case bound:
+			log.Printf("credentials are bound to the boot state (PCR 7)")
+		}
 		if old := signer.LeftoverSharedObjects(); len(old) > 0 {
 			log.Printf("note: TPM objects from an earlier tpm-fido development version are left at %#x; "+
 				"their credentials don't work anymore. If no other user still runs that version, remove them "+
@@ -137,6 +158,11 @@ func newServer() *server {
 		s.pins = signer
 	}
 	s.passkeys = s.newPasskeyStore(path)
+	if t, ok := s.signer.(*tpm.TPM); ok && t.StoreCounterNew() {
+		if err := s.migratePasskeyStore(); err != nil {
+			log.Fatalf("passkey store: %s", err)
+		}
+	}
 
 	if err := s.setupDesktop(); err != nil {
 		log.Fatal(err)
@@ -154,7 +180,8 @@ func warnLockout(t *tpm.TPM) {
 	}
 	if !st.LockoutAuthSet {
 		log.Printf("WARNING: the TPM's lockout authorization is not set. Anyone who can use the TPM " +
-			"can reset its dictionary attack counter and guess the PIN without limit. Set it with " +
+			"(e.g. members of the tss group) can reset its dictionary attack counter and guess the PIN " +
+			"without limit, and can clear the TPM, destroying all its keys. Set it with " +
 			"`tpm2_changeauth -c lockout <password>` and keep the password safe.")
 	}
 	if st.MaxAuthFail == 0 || st.MaxAuthFail > 32 {
@@ -175,9 +202,18 @@ func (s *server) run() {
 
 	go token.Run(ctx)
 
-	for evt := range token.Events() {
-		s.handleEvent(ctx, token, evt)
-		token.Release(evt)
+	// requests and PIN token expiry run on this goroutine, so they don't
+	// race
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case evt := <-token.Events():
+			s.handleEvent(ctx, token, evt)
+			token.Release(evt)
+		case <-ticker.C:
+			s.pin.expire()
+		}
 	}
 }
 
@@ -207,12 +243,12 @@ func (s *server) handleEvent(ctx context.Context, token *fidohid.SoftToken, evt 
 	}
 
 	if req.Command == fidoauth.CmdAuthenticate {
-		log.Printf("got AuthenticateCmd site=%s", sitesignatures.FromAppParam(req.Authenticate.ApplicationParam))
+		log.Printf("got AuthenticateCmd site=%s", logName(sitesignatures.FromAppParam(req.Authenticate.ApplicationParam)))
 
 		s.noteRequest()
 		s.handleAuthenticate(ctx, token, evt)
 	} else if req.Command == fidoauth.CmdRegister {
-		log.Printf("got RegisterCmd site=%s", sitesignatures.FromAppParam(req.Register.ApplicationParam))
+		log.Printf("got RegisterCmd site=%s", logName(sitesignatures.FromAppParam(req.Register.ApplicationParam)))
 		s.noteRequest()
 		s.handleRegister(ctx, token, evt)
 	} else if req.Command == fidoauth.CmdVersion {
@@ -259,6 +295,14 @@ func (s *server) handleAuthenticate(parentCtx context.Context, token *fidohid.So
 		if err != nil {
 			log.Printf("send wrong-data msg err: %s", err)
 		}
+		return
+	}
+
+	// U2F signatures without user presence: browsers never ask for them,
+	// and anyone who can open the device could otherwise sign silently.
+	if req.Authenticate.Ctrl == fidoauth.CtrlDontEnforeUserPresenceAndSign && !*allowSilent {
+		log.Print("U2F signature without user presence refused (see -allow-silent)")
+		token.WriteResponse(parentCtx, evt, nil, statuscode.ConditionsNotSatisfied)
 		return
 	}
 
@@ -349,6 +393,14 @@ func (s *server) handleAuthenticate(parentCtx context.Context, token *fidohid.So
 }
 
 func (s *server) handleRegister(parentCtx context.Context, token *fidohid.SoftToken, evt fidohid.AuthEvent) {
+	// U2F can't ask for the PIN. Once a PIN is set, registrations need it
+	// (as over CTAP2), so U2F registrations are refused: browsers use
+	// CTAP2 anyway.
+	if set, err := s.pins.PINSet(); err != nil || set {
+		log.Print("U2F registration refused: a PIN is set")
+		token.WriteResponse(parentCtx, evt, nil, statuscode.InsNotSupported)
+		return
+	}
 	ctx, cancel := context.WithTimeout(parentCtx, 750*time.Millisecond)
 	defer cancel()
 	req := evt.Req

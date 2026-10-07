@@ -21,8 +21,59 @@ import (
 // state flags
 const stateLegacyDisabled = 0x01
 
-func deviceKeyTemplate() tpm2.TPMTPublic {
-	return hmacKeyTemplate(true)
+// deviceKeyTemplate returns the device key template. With a policy, the
+// key is bound to the boot state: it can only be used through a policy
+// session satisfying PolicyPCR (PCR 7) and PolicyAuthValue.
+func deviceKeyTemplate(policy []byte) tpm2.TPMTPublic {
+	pub := hmacKeyTemplate(true)
+	if policy != nil {
+		pub.AuthPolicy = tpm2.TPM2BDigest{Buffer: policy}
+		pub.ObjectAttributes.UserWithAuth = false
+	}
+	return pub
+}
+
+// ErrBootStateChanged is returned when the device key is bound to the boot
+// state and PCR 7 changed since it was created.
+var ErrBootStateChanged = errors.New("the boot state (PCR 7) changed since the device key was created; " +
+	"restore it (e.g. the Secure Boot configuration) or reset the security key")
+
+// PCR 7 records the Secure Boot state and the keys used to verify the boot
+// chain.
+var bootStatePCRs = tpm2.TPMLPCRSelection{
+	PCRSelections: []tpm2.TPMSPCRSelection{{
+		Hash:      tpm2.TPMAlgSHA256,
+		PCRSelect: tpm2.PCClientCompatible.PCRs(7),
+	}},
+}
+
+// bootStatePolicy runs PolicyPCR and PolicyAuthValue in session.
+func bootStatePolicy(tpm transport.TPM, session tpm2.Session) error {
+	if _, err := (tpm2.PolicyPCR{PolicySession: session.Handle(), Pcrs: bootStatePCRs}).Execute(tpm); err != nil {
+		return fmt.Errorf("PolicyPCR err: %w", err)
+	}
+	if _, err := (tpm2.PolicyAuthValue{PolicySession: session.Handle()}).Execute(tpm); err != nil {
+		return fmt.Errorf("PolicyAuthValue err: %w", err)
+	}
+	return nil
+}
+
+// bootStatePolicyDigest computes the policy for the current PCR 7 value
+// with a trial session.
+func bootStatePolicyDigest(tpm transport.TPM) ([]byte, error) {
+	session, closeSession, err := tpm2.PolicySession(tpm, tpm2.TPMAlgSHA256, 16, tpm2.Trial())
+	if err != nil {
+		return nil, err
+	}
+	defer closeSession()
+	if err := bootStatePolicy(tpm, session); err != nil {
+		return nil, err
+	}
+	rsp, err := tpm2.PolicyGetDigest{PolicySession: session.Handle()}.Execute(tpm)
+	if err != nil {
+		return nil, err
+	}
+	return rsp.PolicyDigest.Buffer, nil
 }
 
 func stateNVPublic(index uint32) tpm2.TPMSNVPublic {
@@ -48,11 +99,16 @@ func (t *TPM) ensureDeviceKey(tpm transport.TPM) error {
 		if err != nil {
 			return err
 		}
-		want := deviceKeyTemplate()
+		bound := len(pub.AuthPolicy.Buffer) > 0
+		want := deviceKeyTemplate(nil)
+		if bound {
+			want = deviceKeyTemplate(pub.AuthPolicy.Buffer)
+		}
 		if pub.Type != want.Type || pub.NameAlg != want.NameAlg || pub.ObjectAttributes != want.ObjectAttributes {
 			return fmt.Errorf("persistent handle 0x%08x is in use by an object that isn't a tpm-fido device key", t.deviceKeyHandle)
 		}
 		t.deviceKeyName = rsp.Name
+		t.deviceKeyBound = bound
 		return t.checkDeviceKeyOwner(tpm)
 	}
 	if !errors.Is(err, tpm2.TPMRCHandle) {
@@ -69,6 +125,13 @@ func (t *TPM) createDeviceKey(tpm transport.TPM) error {
 	defer sec.close()
 	srk := sec.srk
 
+	var policy []byte
+	if t.bindBootState {
+		if policy, err = bootStatePolicyDigest(tpm); err != nil {
+			return err
+		}
+	}
+
 	// the authorization value is the first parameter, encrypted
 	created, err := tpm2.Create{
 		ParentHandle: srkParent(srk),
@@ -77,7 +140,7 @@ func (t *TPM) createDeviceKey(tpm transport.TPM) error {
 				UserAuth: tpm2.TPM2BAuth{Buffer: t.deviceKeyAuth()},
 			},
 		},
-		InPublic: tpm2.New2B(deviceKeyTemplate()),
+		InPublic: tpm2.New2B(deviceKeyTemplate(policy)),
 	}.Execute(tpm, sec.encrypt(encryptIn))
 	if err != nil {
 		return fmt.Errorf("create device key err: %w", err)
@@ -101,6 +164,7 @@ func (t *TPM) createDeviceKey(tpm transport.TPM) error {
 		return fmt.Errorf("persist device key at 0x%08x (requires empty owner auth) err: %w", t.deviceKeyHandle, err)
 	}
 	t.deviceKeyName = loaded.Name
+	t.deviceKeyBound = policy != nil
 	return nil
 }
 
@@ -111,6 +175,7 @@ func (t *TPM) deviceHMAC(tpm transport.TPM, msg []byte, encrypt bool) ([]byte, e
 	// sending it. It is high entropy, so the session doesn't need to be
 	// salted unless the result must be encrypted.
 	auth := tpm2.HMAC(tpm2.TPMAlgSHA256, 16, tpm2.Auth(t.deviceKeyAuth()))
+	var extra []tpm2.Session
 	if encrypt {
 		sec, err := t.secure(tpm)
 		if err != nil {
@@ -118,6 +183,22 @@ func (t *TPM) deviceHMAC(tpm transport.TPM, msg []byte, encrypt bool) ([]byte, e
 		}
 		defer sec.close()
 		auth = sec.auth(t.deviceKeyAuth(), encryptOut)
+		if t.deviceKeyBound {
+			extra = append(extra, sec.encrypt(encryptOut))
+		}
+	}
+	if t.deviceKeyBound {
+		// the session's HMAC includes the authorization value
+		// (PolicyAuthValue)
+		session, closeSession, err := tpm2.PolicySession(tpm, tpm2.TPMAlgSHA256, 16, tpm2.Auth(t.deviceKeyAuth()))
+		if err != nil {
+			return nil, err
+		}
+		defer closeSession()
+		if err := bootStatePolicy(tpm, session); err != nil {
+			return nil, err
+		}
+		auth = session
 	}
 	rsp, err := tpm2.Hmac{
 		Handle: tpm2.AuthHandle{
@@ -127,7 +208,10 @@ func (t *TPM) deviceHMAC(tpm transport.TPM, msg []byte, encrypt bool) ([]byte, e
 		},
 		Buffer:  tpm2.TPM2BMaxBuffer{Buffer: msg},
 		HashAlg: tpm2.TPMAlgSHA256,
-	}.Execute(tpm)
+	}.Execute(tpm, extra...)
+	if t.deviceKeyBound && errors.Is(err, tpm2.TPMRCPolicyFail) {
+		return nil, ErrBootStateChanged
+	}
 	if err != nil {
 		return nil, fmt.Errorf("device key HMAC err: %w", err)
 	}
@@ -221,6 +305,7 @@ func (t *TPM) Reset() error {
 		if err := t.createDeviceKey(tpm); err != nil {
 			return err
 		}
+		t.bootStateChanged = false
 
 		name, exists, _, err := t.pinIndex(tpm)
 		if err != nil {

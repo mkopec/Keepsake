@@ -432,3 +432,150 @@ func hmacSHA256(key []byte, data ...[]byte) []byte {
 	}
 	return m.Sum(nil)
 }
+
+// Someone who recorded the bus sees the primary key template of a
+// credential. With it they can load the credential key, but format 0x30
+// keys can't be used without their authorization value, which only crosses
+// the bus encrypted.
+func TestSniffedTemplateCantSign(t *testing.T) {
+	tp, rec, _ := swtpm(t)
+	rp := sha256.Sum256([]byte("example.com"))
+	kh, _, _, err := tp.RegisterKey(rp[:], KeyOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte("message"))
+	if _, err := tp.SignASN1(kh, rp[:], digest[:], nil); err != nil {
+		t.Fatal(err)
+	}
+
+	private, public, seedField, _ := decodeKeyHandle(kh)
+	seed, flags, _ := parseSeed(seedField)
+	var pSeed, auth []byte
+	err = tp.withTPM(func(tpm transport.TPM) error {
+		var err error
+		if pSeed, err = tp.primarySeed(tpm, seed, flags); err != nil {
+			return err
+		}
+		auth, err = tp.credAuth(tpm, seed, flags)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.contains(pSeed) {
+		t.Fatal("expected the primary seed on the bus (this test assumes a sniffer sees it)")
+	}
+	if rec.contains(auth) {
+		t.Fatal("credential authorization value visible on the bus")
+	}
+
+	// the attacker: sniffed template, no authorization value
+	err = tp.withTPM(func(tpm transport.TPM) error {
+		p, err := createPrimary(tpm, primaryTemplate(pSeed, rp[:], true))
+		if err != nil {
+			return err
+		}
+		defer flush(tpm, p.ObjectHandle)
+		k, err := tpm2.Load{ParentHandle: parentAuth(p), InPrivate: tpm2.TPM2BPrivate{Buffer: private},
+			InPublic: tpm2.BytesAs2B[tpm2.TPMTPublic](public)}.Execute(tpm)
+		if err != nil {
+			return err
+		}
+		defer flush(tpm, k.ObjectHandle)
+		_, err = tpm2.Sign{
+			KeyHandle: tpm2.AuthHandle{Handle: k.ObjectHandle, Name: k.Name, Auth: tpm2.PasswordAuth(nil)},
+			Digest:    tpm2.TPM2BDigest{Buffer: digest[:]},
+			InScheme: tpm2.TPMTSigScheme{Scheme: tpm2.TPMAlgECDSA,
+				Details: tpm2.NewTPMUSigScheme(tpm2.TPMAlgECDSA, &tpm2.TPMSSchemeHash{HashAlg: tpm2.TPMAlgSHA256})},
+			Validation: tpm2.TPMTTKHashCheck{Tag: tpm2.TPMSTHashCheck, Hierarchy: tpm2.TPMRHNull},
+		}.Execute(tpm)
+		if err == nil {
+			t.Error("signed with the sniffed template and an empty password")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBootStateBinding(t *testing.T) {
+	sock := os.Getenv("TPMFIDO_SWTPM")
+	tp, _, h := swtpm(t)
+	// recreate the device key bound to PCR 7
+	tp.bindBootState = true
+	if err := tp.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if bound, changed := tp.DeviceKeyBound(); !bound || changed {
+		t.Fatalf("bound=%v changed=%v", bound, changed)
+	}
+	rp := sha256.Sum256([]byte("example.com"))
+	kh, _, _, err := tp.RegisterKey(rp[:], KeyOptions{HMACSecret: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := sha256.Sum256([]byte("m"))
+	if _, err := tp.SignASN1(kh, rp[:], d[:], nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tp.HMACSecret(kh, rp[:], nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// change the boot state: extend PCR 7
+	err = tp.withTPM(func(tpm transport.TPM) error {
+		_, err := tpm2.PCRExtend{
+			PCRHandle: tpm2.AuthHandle{Handle: tpm2.TPMHandle(7), Auth: tpm2.PasswordAuth(nil)},
+			Digests: tpm2.TPMLDigestValues{Digests: []tpm2.TPMTHA{{
+				HashAlg: tpm2.TPMAlgSHA256, Digest: bytes.Repeat([]byte{1}, 32)}}},
+		}.Execute(tpm)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tp.SignASN1(kh, rp[:], d[:], nil); !errors.Is(err, ErrBootStateChanged) {
+		t.Fatalf("sign after boot state change: %v", err)
+	}
+
+	// tpm-fido still starts, so the user can reset
+	restarted, err := newTPM(sock, h, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, changed := restarted.DeviceKeyBound(); !changed {
+		t.Fatal("boot state change not detected at startup")
+	}
+	if err := restarted.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if _, changed := restarted.DeviceKeyBound(); changed {
+		t.Fatal("still changed after reset")
+	}
+}
+
+// Credentials created before format 0x30 keep working.
+func TestFormatV2StillWorks(t *testing.T) {
+	tp, _, _ := swtpm(t)
+	rp := sha256.Sum256([]byte("example.com"))
+	pin := pinHashOf("1234")
+	if err := tp.SetPIN(pin, nil, 8); err != nil {
+		t.Fatal(err)
+	}
+	d := sha256.Sum256([]byte("m"))
+	for _, o := range []KeyOptions{{CredProtect: 1, HMACSecret: true}, {CredProtect: 3, Discoverable: true}} {
+		kh, x, y, err := tp.registerKey(rp[:], keyHandleFlags{KeyOptions: o, format: keyHandleFormatV2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f, _ := keyHandleInfo(kh); f.format != keyHandleFormatV2 || f.credAuth {
+			t.Fatalf("flags %+v", f)
+		}
+		sig, err := tp.SignASN1(kh, rp[:], d[:], pin)
+		if err != nil || !ecdsa.VerifyASN1(&ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y}, d[:], sig) {
+			t.Fatalf("%+v: %v", o, err)
+		}
+	}
+}

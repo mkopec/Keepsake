@@ -83,16 +83,30 @@ func (t *SoftToken) Events() chan AuthEvent {
 }
 
 func (t *SoftToken) Run(ctx context.Context) {
+	// Channel IDs are random, so programs can't predict each other's, and
+	// only the most recent maxChannels are remembered. Every program that
+	// can open the device sees all responses, including channel IDs, so
+	// this only stops blind interference.
 	channels := make(map[uint32]bool)
-	allocateChan := func() (uint32, bool) {
-		for k := uint32(1); k < (1<<32)-1; k++ {
-			inUse := channels[k]
-			if !inUse {
-				channels[k] = true
-				return k, true
+	var channelOrder []uint32
+	allocateChan := func() uint32 {
+		for {
+			var b [4]byte
+			if _, err := rand.Read(b[:]); err != nil {
+				panic(err)
 			}
+			k := binary.BigEndian.Uint32(b[:])
+			if k == 0 || k == broadcastChannel || channels[k] {
+				continue
+			}
+			channels[k] = true
+			channelOrder = append(channelOrder, k)
+			if len(channelOrder) > maxChannels {
+				delete(channels, channelOrder[0])
+				channelOrder = channelOrder[1:]
+			}
+			return k
 		}
-		return 0, false
 	}
 
 	pktChan := make(chan Packet)
@@ -106,25 +120,37 @@ func (t *SoftToken) Run(ctx context.Context) {
 			cmd       CmdType
 		)
 
+		var nextSeq byte
 		for pkt := range pktChan {
-			if !pkt.IsInitial && pkt.ChannelID != reqChanID {
+			if !pkt.IsInitial && (pkt.ChannelID != reqChanID || innerMsg == nil) {
 				log.Printf("dropping continuation packet for channel 0x%08x", pkt.ChannelID)
+				continue
+			}
+			if !pkt.IsInitial && pkt.SeqNo != nextSeq {
+				log.Printf("dropping message with out of order continuation packet")
+				innerMsg = nil
 				continue
 			}
 			if pkt.IsInitial {
 				if len(innerMsg) > 0 {
 					log.Print("new initial packet while pending packets still exist")
-					innerMsg = make([]byte, 0)
-					needSize = 0
 				}
+				innerMsg = make([]byte, 0, pkt.TotalSize)
+				nextSeq = 0
 				needSize = pkt.TotalSize
 				reqChanID = pkt.ChannelID
 				cmd = pkt.Command
+			} else {
+				nextSeq++
 			}
 			innerMsg = append(innerMsg, pkt.Data...)
 			if len(innerMsg) >= int(needSize) {
 				break
 			}
+		}
+		if innerMsg == nil || len(innerMsg) < int(needSize) {
+			// the packet channel closed
+			return
 		}
 
 		innerMsg = innerMsg[:int(needSize)]
@@ -142,10 +168,11 @@ func (t *SoftToken) Run(ctx context.Context) {
 			}
 			t.mu.Unlock()
 		case CmdInit:
-			chanID, ok := allocateChan()
-			if !ok {
-				log.Fatalf("Channel id exhaustion")
+			if reqChanID != broadcastChannel && !channels[reqChanID] {
+				t.writeError(reqChanID, errInvalidChannel)
+				continue
 			}
+			chanID := allocateChan()
 
 			var nonce [8]byte
 			copy(nonce[:], innerMsg)
@@ -158,6 +185,10 @@ func (t *SoftToken) Run(ctx context.Context) {
 				continue
 			}
 		case CmdMsg, CmdCbor:
+			if !channels[reqChanID] {
+				t.writeError(reqChanID, errInvalidChannel)
+				continue
+			}
 			txCtx, ok := t.beginTx(ctx, reqChanID)
 			if !ok {
 				t.writeError(reqChanID, errChannelBusy)
@@ -226,8 +257,12 @@ const (
 	nmsgCapability     = 0x08
 
 	// CTAPHID_ERROR codes
-	errInvalidCmd  = 0x01
-	errChannelBusy = 0x06
+	errInvalidCmd     = 0x01
+	errChannelBusy    = 0x06
+	errInvalidChannel = 0x0B
+
+	broadcastChannel = 0xffffffff
+	maxChannels      = 256
 
 	// CTAPHID_KEEPALIVE status codes
 	KeepaliveProcessing = 0x01
@@ -513,6 +548,11 @@ func (resp *initResponse) Marshal() []byte {
 	})
 
 	return buf.Bytes()
+}
+
+// ChannelID returns the CTAPHID channel of the request.
+func (evt AuthEvent) ChannelID() uint32 {
+	return evt.chanID
 }
 
 // IsCBOR reports whether evt is a CTAP2 (CTAPHID_CBOR) request.

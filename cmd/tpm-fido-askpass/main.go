@@ -15,6 +15,10 @@
 // Without a GNOME system prompter it runs the system's default askpass
 // program ($TPMFIDO_ASKPASS_FALLBACK, or OpenSSH's ssh-askpass).
 //
+// tpm-fido-askpass only talks to tpm-fido if the D-Bus name is owned by
+// the tpm-fido binary installed next to it ($TPMFIDO_PATH overrides the
+// path): any program can claim the name while tpm-fido isn't running.
+//
 // The main use is gcr-ssh-agent, GNOME's SSH agent: it runs an ssh-agent
 // that asks for security key PINs through SSH_ASKPASS.
 package main
@@ -78,8 +82,8 @@ func run() int {
 		return notify(ctx, conn, message, start)
 	}
 
-	if kind == "" && strings.Contains(message, "PIN") && hasOwner(conn, tpmFidoBusName) {
-		pin, err := askTpmFido(ctx, conn, message)
+	if owner, ok := genuineTpmFido(conn); kind == "" && strings.Contains(message, "PIN") && ok {
+		pin, err := askTpmFido(ctx, conn, owner, message)
 		var derr dbus.Error
 		switch {
 		case err == nil:
@@ -131,9 +135,46 @@ func hasOwner(conn *dbus.Conn, name string) bool {
 	return err == nil && has
 }
 
-func askTpmFido(ctx context.Context, conn *dbus.Conn, message string) (string, error) {
+// genuineTpmFido returns the unique bus name of tpm-fido if its well-known
+// name is owned by a process of this user running the expected tpm-fido
+// binary. Calls must go to the unique name, which can't change owner.
+func genuineTpmFido(conn *dbus.Conn) (string, bool) {
+	bus := conn.BusObject()
+	var owner string
+	if bus.Call("org.freedesktop.DBus.GetNameOwner", 0, tpmFidoBusName).Store(&owner) != nil {
+		return "", false
+	}
+	var uid, pid uint32
+	if bus.Call("org.freedesktop.DBus.GetConnectionUnixUser", 0, owner).Store(&uid) != nil ||
+		int(uid) != os.Getuid() {
+		return "", false
+	}
+	if bus.Call("org.freedesktop.DBus.GetConnectionUnixProcessID", 0, owner).Store(&pid) != nil {
+		return "", false
+	}
+	exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return "", false
+	}
+	want := os.Getenv("TPMFIDO_PATH")
+	if want == "" {
+		self, err := os.Executable()
+		if err != nil {
+			return "", false
+		}
+		want = filepath.Join(filepath.Dir(self), "tpm-fido")
+	}
+	want, err = filepath.EvalSymlinks(want)
+	if err != nil || exe != want {
+		fmt.Fprintf(os.Stderr, "tpm-fido-askpass: %s is owned by %s, not %s; not using it\n", tpmFidoBusName, exe, want)
+		return "", false
+	}
+	return owner, true
+}
+
+func askTpmFido(ctx context.Context, conn *dbus.Conn, owner, message string) (string, error) {
 	var pin string
-	err := conn.Object(tpmFidoBusName, tpmFidoPath).
+	err := conn.Object(owner, tpmFidoPath).
 		CallWithContext(ctx, tpmFidoInterface+".AskPIN", 0, message).Store(&pin)
 	return pin, err
 }
@@ -141,10 +182,11 @@ func askTpmFido(ctx context.Context, conn *dbus.Conn, message string) (string, e
 // tpmFidoHandles reports whether tpm-fido received a security key request
 // since start, waiting up to tpmFidoWait for one.
 func tpmFidoHandles(ctx context.Context, conn *dbus.Conn, start time.Time) bool {
-	if !hasOwner(conn, tpmFidoBusName) {
+	owner, ok := genuineTpmFido(conn)
+	if !ok {
 		return false
 	}
-	obj := conn.Object(tpmFidoBusName, tpmFidoPath)
+	obj := conn.Object(owner, tpmFidoPath)
 	deadline := time.Now().Add(tpmFidoWait)
 	for {
 		var age uint64

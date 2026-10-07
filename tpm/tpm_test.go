@@ -9,17 +9,21 @@ import (
 
 func TestParseSeed(t *testing.T) {
 	seed := bytes.Repeat([]byte{7}, seedSizeBytes)
-	flags := func(o KeyOptions) keyHandleFlags { return keyHandleFlags{KeyOptions: o} }
+	v2 := func(o KeyOptions) keyHandleFlags { return keyHandleFlags{KeyOptions: o, format: keyHandleFormatV2} }
+	v3 := func(o KeyOptions) keyHandleFlags {
+		return keyHandleFlags{KeyOptions: o, format: keyHandleFormat, credAuth: true}
+	}
 	cases := []struct {
 		field []byte
 		want  keyHandleFlags
 	}{
 		{seed, keyHandleFlags{legacy: true}},
-		{append([]byte{0x20}, seed...), flags(KeyOptions{CredProtect: 1})},
-		{append([]byte{0x21}, seed...), flags(KeyOptions{HMACSecret: true, CredProtect: 1})},
-		{append([]byte{0x22}, seed...), flags(KeyOptions{Discoverable: true, CredProtect: 1})},
-		{append([]byte{0x26}, seed...), flags(KeyOptions{Discoverable: true, CredProtect: 2})},
-		{append([]byte{0x2b}, seed...), flags(KeyOptions{HMACSecret: true, Discoverable: true, CredProtect: 3})},
+		{append([]byte{0x20}, seed...), v2(KeyOptions{CredProtect: 1})},
+		{append([]byte{0x2b}, seed...), v2(KeyOptions{HMACSecret: true, Discoverable: true, CredProtect: 3})},
+		{append([]byte{0x30}, seed...), v3(KeyOptions{CredProtect: 1})},
+		{append([]byte{0x31}, seed...), v3(KeyOptions{HMACSecret: true, CredProtect: 1})},
+		{append([]byte{0x36}, seed...), v3(KeyOptions{Discoverable: true, CredProtect: 2})},
+		{append([]byte{0x3b}, seed...), v3(KeyOptions{HMACSecret: true, Discoverable: true, CredProtect: 3})},
 	}
 	for _, c := range cases {
 		got, f, err := parseSeed(c.field)
@@ -31,10 +35,10 @@ func TestParseSeed(t *testing.T) {
 		}
 	}
 
-	// 0x1X didn't authenticate the flags and is no longer accepted; 0x2c
+	// 0x1X didn't authenticate the flags and is no longer accepted; 0x3c
 	// has both credProtect flags
 	for _, bad := range [][]byte{nil, seed[:19], append([]byte{0x01}, seed...), append([]byte{0x12}, seed...),
-		append([]byte{0x2c}, seed...), append([]byte{0x30}, seed...), append(seed, 1, 2)} {
+		append([]byte{0x3c}, seed...), append([]byte{0x40}, seed...), append(seed, 1, 2)} {
 		if _, _, err := parseSeed(bad); err == nil {
 			t.Errorf("accepted invalid seed %x", bad)
 		}
