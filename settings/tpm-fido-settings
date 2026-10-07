@@ -6,13 +6,28 @@ import os
 import sys
 import threading
 
-import gi
+MISSING = ("{} is missing. Install {} (Arch: {}, Fedora: {}, Debian/Ubuntu: {}).")
 
-gi.require_version("Gtk", "4.0")
-gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+try:
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+except (ImportError, ValueError) as e:
+    sys.exit(MISSING.format(f"GTK 4 / libadwaita for Python ({e})", "PyGObject and libadwaita",
+                            "python-gobject libadwaita", "python3-gobject libadwaita", "python3-gi gir1.2-adw-1"))
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+try:
+    import fido2  # noqa: F401
+    from importlib.metadata import version
+
+    if int(version("fido2").split(".")[0]) < 1:
+        sys.exit(f"python-fido2 {version('fido2')} is too old, version 1.0 or newer is needed.")
+except ImportError:
+    sys.exit(MISSING.format("python-fido2", "python-fido2 1.0 or newer",
+                            "python-fido2", "python3-fido2", "python3-fido2"))
 from securitykeys import (  # noqa: E402
     MIN_PIN_LENGTH,
     SecurityKeyError,
