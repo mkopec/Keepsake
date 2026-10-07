@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Security Keys
+Comment=Manage the PIN and passkeys of security keys
+Exec=tpm-fido-settings
+Icon=dialog-password
+Terminal=false
+Categories=GTK;GNOME;Settings;Security;
+Keywords=FIDO;FIDO2;U2F;WebAuthn;passkey;PIN;TPM;YubiKey;
+StartupNotify=true

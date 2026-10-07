@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Security Keys: manage the PIN, passkeys and reset of tpm-fido and other
+FIDO2 security keys."""
+
+import os
+import sys
+import threading
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from securitykeys import (  # noqa: E402
+    MIN_PIN_LENGTH,
+    SecurityKeyError,
+    list_keys,
+)
+
+APP_ID = "io.github.psanford.TpmFido.Settings"
+
+
+def run_in_thread(fn, on_done):
+    """Runs fn in a thread, then on_done(result, error) in the main loop.
+    Security key operations can block for a long time waiting for a touch."""
+
+    def worker():
+        try:
+            result, error = fn(), None
+        except SecurityKeyError as e:
+            result, error = None, str(e)
+        except Exception as e:  # unexpected: show it rather than crash
+            result, error = None, f"Unexpected error: {e}"
+        GLib.idle_add(on_done, result, error)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def pin_row(title):
+    # Enter activates the dialog's default response
+    return Adw.PasswordEntryRow(title=title, activates_default=True)
+
+
+def boxed_list(*rows):
+    box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+    box.add_css_class("boxed-list")
+    for r in rows:
+        box.append(r)
+    return box
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Security Keys", default_width=600, default_height=680)
+
+        self.keys = []
+        self.key = None
+        self.pin = None  # the PIN entered to show passkeys
+        self.passkeys = None
+
+        self.toasts = Adw.ToastOverlay()
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh")
+        refresh.connect("clicked", lambda *_: self.reload())
+        header.pack_start(refresh)
+        view.add_top_bar(header)
+        self.stack = Gtk.Stack()
+        view.set_content(self.stack)
+        self.toasts.set_child(view)
+        self.set_content(self.toasts)
+
+        self.reload()
+
+    def toast(self, text, timeout=4):
+        toast = Adw.Toast(title=text, timeout=timeout)
+        self.toasts.add_toast(toast)
+        return toast
+
+    def busy(self, busy):
+        self.stack.set_sensitive(not busy)
+
+    # loading
+
+    def reload(self):
+        self.busy(True)
+        run_in_thread(list_keys, self._loaded)
+
+    def _loaded(self, keys, error):
+        self.busy(False)
+        self.keys = keys or []
+        if self.key is None or self.key.path not in [k.path for k in self.keys]:
+            self.key = self.keys[0] if self.keys else None
+            self.pin = None
+            self.passkeys = None
+        else:
+            self.key = next(k for k in self.keys if k.path == self.key.path)
+        if error:
+            self.toast(error)
+        self.render()
+
+    def select_key(self, index):
+        if self.keys[index] is not self.key:
+            self.key = self.keys[index]
+            self.pin = None
+            self.passkeys = None
+            self.render()
+
+    # rendering
+
+    def render(self):
+        old = self.stack.get_visible_child()
+        if self.key is None:
+            page = Adw.StatusPage(
+                icon_name="channel-secure-symbolic",
+                title="No Security Keys",
+                description="Plug in a security key, or start tpm-fido to use the security key built into this computer.",
+            )
+        else:
+            page = self.render_key()
+        self.stack.add_child(page)
+        self.stack.set_visible_child(page)
+        if old is not None:
+            self.stack.remove(old)
+
+    def render_key(self):
+        key = self.key
+        page = Adw.PreferencesPage()
+
+        device = Adw.PreferencesGroup()
+        if len(self.keys) > 1:
+            combo = Adw.ComboRow(title="Security Key", model=Gtk.StringList.new([k.name for k in self.keys]))
+            combo.set_selected(self.keys.index(key))
+            combo.connect("notify::selected", lambda row, _: self.select_key(row.get_selected()))
+            device.add(combo)
+        else:
+            device.set_title(key.name)
+        if key.is_tpm_fido:
+            device.set_description("Built into this computer, protected by its TPM security chip.")
+        page.add(device)
+
+        if not key.pin_supported:
+            unsupported = Adw.PreferencesGroup(description="This security key doesn’t support PINs or passkeys.")
+            page.add(unsupported)
+            return page
+
+        pin = Adw.PreferencesGroup()
+        if key.pin_set:
+            row = Adw.ActionRow(title="PIN", subtitle="Websites can ask for the PIN to verify it’s you")
+            button = Gtk.Button(label="Change…", valign=Gtk.Align.CENTER)
+            button.connect("clicked", lambda *_: self.pin_dialog(change=True))
+        else:
+            row = Adw.ActionRow(title="PIN", subtitle="Not set. Websites can’t verify it’s you, and passkeys can’t be managed")
+            button = Gtk.Button(label="Set PIN…", valign=Gtk.Align.CENTER)
+            button.add_css_class("suggested-action")
+            button.connect("clicked", lambda *_: self.pin_dialog(change=False))
+        row.add_suffix(button)
+        pin.add(row)
+        page.add(pin)
+
+        if key.passkeys_supported:
+            page.add(self.render_passkeys())
+
+        reset = Adw.PreferencesGroup()
+        row = Adw.ButtonRow(title="Reset Security Key…")
+        row.add_css_class("destructive-action")
+        row.connect("activated", lambda *_: self.reset_dialog())
+        reset.add(row)
+        page.add(reset)
+        return page
+
+    def render_passkeys(self):
+        group = Adw.PreferencesGroup(
+            title="Passkeys",
+            description="Passkeys stored on this security key let you sign in to websites without typing a username.",
+        )
+        if self.passkeys is None:
+            row = Adw.ButtonRow(title="Show Passkeys…")
+            row.set_sensitive(self.key.pin_set)
+            row.connect("activated", lambda *_: self.unlock_dialog())
+            group.add(row)
+        elif not self.passkeys:
+            group.add(Adw.ActionRow(title="No Passkeys", subtitle="Passkeys you create on websites appear here"))
+        else:
+            for pk in self.passkeys:
+                row = Adw.ActionRow(title=GLib.markup_escape_text(pk.display_name or pk.user_name or "Unnamed"),
+                                    subtitle=GLib.markup_escape_text(pk.rp_id))
+                if pk.display_name and pk.user_name and pk.display_name.casefold() != pk.user_name.casefold():
+                    row.set_subtitle(GLib.markup_escape_text(f"{pk.rp_id} · {pk.user_name}"))
+                delete = Gtk.Button(icon_name="user-trash-symbolic", tooltip_text="Delete Passkey", valign=Gtk.Align.CENTER)
+                delete.add_css_class("flat")
+                delete.connect("clicked", lambda _b, pk=pk: self.delete_dialog(pk))
+                row.add_suffix(delete)
+                group.add(row)
+        return group
+
+    # dialogs
+
+    def pin_dialog(self, change):
+        current = pin_row("Current PIN") if change else None
+        new, confirm = pin_row("New PIN"), pin_row("Confirm New PIN")
+        rows = [r for r in (current, new, confirm) if r]
+        dialog = Adw.AlertDialog(
+            heading="Change PIN" if change else "Set PIN",
+            body=f"Websites ask for the PIN to verify it’s you. Use at least {MIN_PIN_LENGTH} characters.",
+            extra_child=boxed_list(*rows),
+        )
+        action = "Change PIN" if change else "Set PIN"
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("ok", action)
+        dialog.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("ok")
+        dialog.set_close_response("cancel")
+
+        def validate(*_):
+            ok = len(new.get_text()) >= MIN_PIN_LENGTH and new.get_text() == confirm.get_text()
+            if current:
+                ok = ok and current.get_text() != ""
+            dialog.set_response_enabled("ok", ok)
+
+        for r in rows:
+            r.connect("changed", validate)
+        validate()
+
+        def respond(_d, response):
+            if response != "ok":
+                return
+            key, pin = self.key, new.get_text()
+            if change:
+                old = current.get_text()
+                fn = lambda: key.change_pin(old, pin)  # noqa: E731
+            else:
+                fn = lambda: key.set_pin(pin)  # noqa: E731
+            self.busy(True)
+            run_in_thread(fn, lambda _r, err: self._done(err, "PIN changed" if change else "PIN set", forget_pin=True))
+
+        dialog.connect("response", respond)
+        dialog.present(self)
+        rows[0].grab_focus()
+
+    def unlock_dialog(self):
+        entry = pin_row("PIN")
+        dialog = Adw.AlertDialog(
+            heading="Enter PIN",
+            body="Enter the PIN of this security key to show its passkeys.",
+            extra_child=boxed_list(entry),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("ok", "Show Passkeys")
+        dialog.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("ok")
+        dialog.set_close_response("cancel")
+        entry.connect("changed", lambda *_: dialog.set_response_enabled("ok", entry.get_text() != ""))
+        dialog.set_response_enabled("ok", False)
+
+        def respond(_d, response):
+            if response != "ok":
+                return
+            key, pin = self.key, entry.get_text()
+            self.busy(True)
+
+            def done(passkeys, err):
+                self.busy(False)
+                if err:
+                    self.toast(err)
+                    return
+                self.pin, self.passkeys = pin, passkeys
+                self.render()
+
+            run_in_thread(lambda: key.passkeys(pin), done)
+
+        dialog.connect("response", respond)
+        dialog.present(self)
+        entry.grab_focus()
+
+    def delete_dialog(self, pk):
+        who = pk.user_name or pk.display_name
+        dialog = Adw.AlertDialog(
+            heading="Delete Passkey?",
+            body=(f"You will no longer be able to sign in to {pk.rp_id}"
+                  + (f" as “{who}”" if who else "")
+                  + " with this passkey. Deleted passkeys can’t be restored."),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_close_response("cancel")
+
+        def respond(_d, response):
+            if response != "delete":
+                return
+            key, pin = self.key, self.pin
+            self.busy(True)
+
+            def fn():
+                key.delete_passkey(pin, pk)
+                return key.passkeys(pin)
+
+            def done(passkeys, err):
+                self.busy(False)
+                if err:
+                    self.toast(err)
+                    return
+                self.passkeys = passkeys
+                self.render()
+                self.toast("Passkey deleted")
+
+            run_in_thread(fn, done)
+
+        dialog.connect("response", respond)
+        dialog.present(self)
+
+    def reset_dialog(self):
+        if self.key.is_tpm_fido:
+            how = "You will be asked to confirm the reset."
+        else:
+            how = "Unplug and plug in the security key, then reset it within 10 seconds and touch it when it blinks."
+        dialog = Adw.AlertDialog(
+            heading="Reset Security Key?",
+            body=("All passkeys, website registrations and the PIN will be permanently deleted from this "
+                  "security key. You won’t be able to sign in with them anymore. " + how),
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("reset", "Reset")
+        dialog.set_response_appearance("reset", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_close_response("cancel")
+
+        def respond(_d, response):
+            if response != "reset":
+                return
+            key = self.key
+            self.busy(True)
+            # shown until the security key answers
+            confirm = self.toast("Confirm the reset on your security key", timeout=0)
+
+            def done(_r, err):
+                confirm.dismiss()
+                self._done(err, "Security key reset", forget_pin=True)
+
+            run_in_thread(key.reset, done)
+
+        dialog.connect("response", respond)
+        dialog.present(self)
+
+    def _done(self, err, message, forget_pin=False):
+        self.busy(False)
+        if err:
+            self.toast(err)
+            return
+        if forget_pin:
+            self.pin = None
+            self.passkeys = None
+        self.render()
+        self.toast(message)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        win = self.props.active_window or Window(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))
