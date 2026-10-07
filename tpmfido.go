@@ -31,10 +31,7 @@ import (
 
 var backend = flag.String("backend", "tpm", "tpm|memory")
 var device = flag.String("device", "/dev/tpmrm0", "TPM device path")
-var counterIndex = flag.Uint("counter-index", tpm.DefaultCounterIndex, "TPM NV index used for the signature counter")
-var pinIndex = flag.Uint("pin-index", tpm.DefaultPINIndex, "TPM NV index used for the clientPIN")
-var stateIndex = flag.Uint("state-index", tpm.DefaultStateIndex, "TPM NV index used for state flags")
-var deviceKeyHandle = flag.Uint("device-key-handle", tpm.DefaultDeviceKeyHandle, "TPM persistent handle of the device key")
+var slot = flag.Int("slot", -1, "TPM handle slot (0-65535), default: the user ID. Each user of the TPM needs their own")
 var passkeyStore = flag.String("passkey-store", "", "passkey store path (default $XDG_DATA_HOME/tpm-fido/passkeys)")
 
 func main() {
@@ -102,13 +99,16 @@ func newServer() *server {
 	}
 
 	if *backend == "tpm" {
-		signer, err := tpm.New(*device, tpm.Handles{
-			CounterIndex: uint32(*counterIndex),
-			PINIndex:     uint32(*pinIndex),
-			StateIndex:   uint32(*stateIndex),
-			DeviceKey:    uint32(*deviceKeyHandle),
-			SRKNameFile:  filepath.Join(filepath.Dir(path), "srk-name"),
-		})
+		if *slot < 0 {
+			*slot = os.Getuid()
+		}
+		if *slot > tpm.MaxSlot {
+			log.Fatalf("user ID %d is too large for a TPM handle slot, choose one with -slot (0-%d) that no other user uses", *slot, tpm.MaxSlot)
+		}
+		handles := tpm.HandlesForSlot(*slot)
+		handles.SRKNameFile = filepath.Join(filepath.Dir(path), "srk-name")
+		handles.UserSecretFile = filepath.Join(filepath.Dir(path), "user-secret")
+		signer, err := tpm.New(*device, handles)
 		if errors.Is(err, fs.ErrPermission) {
 			log.Fatalf("%s: add your user to the group owning %s (usually tss) and log in again", err, *device)
 		}
@@ -116,6 +116,11 @@ func newServer() *server {
 			log.Fatalf("TPM: %s", err)
 		}
 		warnLockout(signer)
+		if old := signer.LeftoverSharedObjects(); len(old) > 0 {
+			log.Printf("note: TPM objects from an earlier tpm-fido development version are left at %#x; "+
+				"their credentials don't work anymore. If no other user still runs that version, remove them "+
+				"with tpm2_nvundefine -C o <index> and tpm2_evictcontrol -C o -c <handle>", old)
+		}
 		s.signer = signer
 		s.pins = signer
 	} else if *backend == "memory" {

@@ -3,6 +3,7 @@ package tpm
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -12,10 +13,6 @@ import (
 	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/google/go-tpm/tpmutil"
 )
-
-// DefaultCounterIndex is the NV index used for the signature counter. It is
-// in the owner range (0x01000000-0x013FFFFF) of the TCG handle registry.
-const DefaultCounterIndex = 0x0100F1D0
 
 // counterOffset is added to the NV counter value. Earlier versions reported
 // the seconds since 2021-01-01 as the signature counter; starting above any
@@ -41,16 +38,37 @@ type Handles struct {
 	// SRKNameFile pins the name of the TPM's storage root key, see
 	// secure.go. Empty disables pinning.
 	SRKNameFile string
+	// UserSecretFile holds the user secret, see user.go. It is created if
+	// it doesn't exist.
+	UserSecretFile string
 }
 
-// DefaultHandles returns the default TPM handles.
-func DefaultHandles() Handles {
-	return Handles{
-		CounterIndex: DefaultCounterIndex,
-		PINIndex:     DefaultPINIndex,
-		StateIndex:   DefaultStateIndex,
-		DeviceKey:    DefaultDeviceKeyHandle,
-	}
+// SharedHandles are the handles development versions before per-user
+// slots used for every user.
+var SharedHandles = Handles{
+	CounterIndex: 0x0100F1D0,
+	PINIndex:     0x0100F1D1,
+	StateIndex:   0x0100F1D2,
+	DeviceKey:    0x8100F1D0,
+}
+
+// LeftoverSharedObjects returns the handles in SharedHandles that are in
+// use, which were probably created by an earlier development version.
+func (t *TPM) LeftoverSharedObjects() []uint32 {
+	var used []uint32
+	t.withTPM(func(tpm transport.TPM) error {
+		h := SharedHandles
+		for _, idx := range []uint32{h.CounterIndex, h.PINIndex, h.StateIndex} {
+			if _, err := (tpm2new.NVReadPublic{NVIndex: tpm2new.TPMHandle(idx)}).Execute(tpm); err == nil {
+				used = append(used, idx)
+			}
+		}
+		if _, err := (tpm2new.ReadPublic{ObjectHandle: tpm2new.TPMHandle(h.DeviceKey)}).Execute(tpm); err == nil {
+			used = append(used, h.DeviceKey)
+		}
+		return nil
+	})
+	return used
 }
 
 type TPM struct {
@@ -67,6 +85,8 @@ type TPM struct {
 
 	// pinned SRK name, set by New
 	srkName []byte
+	// set by New
+	userSecret []byte
 
 	// dial replaces opening devicePath in tests
 	dial func() (io.ReadWriteCloser, error)
@@ -92,6 +112,15 @@ func newTPM(devicePath string, h Handles, dial func() (io.ReadWriteCloser, error
 		stateIndex:      h.StateIndex,
 		deviceKeyHandle: h.DeviceKey,
 	}
+
+	if h.UserSecretFile == "" {
+		return nil, errors.New("no user secret file")
+	}
+	secret, err := loadUserSecret(h.UserSecretFile)
+	if err != nil {
+		return nil, fmt.Errorf("user secret: %w", err)
+	}
+	t.userSecret = secret
 
 	tpm, err := t.open()
 	if err != nil {

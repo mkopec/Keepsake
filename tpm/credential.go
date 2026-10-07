@@ -389,6 +389,7 @@ func (t *TPM) CheckKey(keyHandle, applicationParam []byte) error {
 // bound to the PIN need uvPinHash, the PIN hash; it is ignored for other
 // credentials.
 func (t *TPM) SignASN1(keyHandle, applicationParam, digest, uvPinHash []byte) ([]byte, error) {
+	uvPinHash = t.pinAuth(uvPinHash)
 	var sig []byte
 	err := t.withTPM(func(tpm transport.TPM) error {
 		flags, err := keyHandleInfo(keyHandle)

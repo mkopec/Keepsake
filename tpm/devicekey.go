@@ -8,13 +8,6 @@ import (
 	"github.com/google/go-tpm/tpm2/transport"
 )
 
-// DefaultDeviceKeyHandle is the persistent handle of the device key. It is
-// in the owner range (0x81000000-0x817FFFFF) of the TCG handle registry.
-const DefaultDeviceKeyHandle = 0x8100F1D0
-
-// DefaultStateIndex is the NV index holding tpm-fido's state flags.
-const DefaultStateIndex = 0x0100F1D2
-
 // The device key is a keyed hash key that every credential created by this
 // version depends on: credential seeds, the hmac-secret secrets without user
 // verification and the passkey store key are HMACs computed with it.
@@ -60,7 +53,7 @@ func (t *TPM) ensureDeviceKey(tpm transport.TPM) error {
 			return fmt.Errorf("persistent handle 0x%08x is in use by an object that isn't a tpm-fido device key", t.deviceKeyHandle)
 		}
 		t.deviceKeyName = rsp.Name
-		return nil
+		return t.checkDeviceKeyOwner(tpm)
 	}
 	if !errors.Is(err, tpm2.TPMRCHandle) {
 		return fmt.Errorf("read device key err: %w", err)
@@ -69,16 +62,23 @@ func (t *TPM) ensureDeviceKey(tpm transport.TPM) error {
 }
 
 func (t *TPM) createDeviceKey(tpm transport.TPM) error {
-	srk, err := createSRK(tpm)
+	sec, err := t.secure(tpm)
 	if err != nil {
 		return err
 	}
-	defer flush(tpm, srk.ObjectHandle)
+	defer sec.close()
+	srk := sec.srk
 
+	// the authorization value is the first parameter, encrypted
 	created, err := tpm2.Create{
 		ParentHandle: srkParent(srk),
-		InPublic:     tpm2.New2B(deviceKeyTemplate()),
-	}.Execute(tpm)
+		InSensitive: tpm2.TPM2BSensitiveCreate{
+			Sensitive: &tpm2.TPMSSensitiveCreate{
+				UserAuth: tpm2.TPM2BAuth{Buffer: t.deviceKeyAuth()},
+			},
+		},
+		InPublic: tpm2.New2B(deviceKeyTemplate()),
+	}.Execute(tpm, sec.encrypt(encryptIn))
 	if err != nil {
 		return fmt.Errorf("create device key err: %w", err)
 	}
@@ -107,24 +107,27 @@ func (t *TPM) createDeviceKey(tpm transport.TPM) error {
 // deviceHMAC computes HMAC-SHA-256 of msg with the device key. With
 // encrypt, the result is encrypted on the bus.
 func (t *TPM) deviceHMAC(tpm transport.TPM, msg []byte, encrypt bool) ([]byte, error) {
-	var sessions []tpm2.Session
+	// An HMAC session proves knowledge of the authorization value without
+	// sending it. It is high entropy, so the session doesn't need to be
+	// salted unless the result must be encrypted.
+	auth := tpm2.HMAC(tpm2.TPMAlgSHA256, 16, tpm2.Auth(t.deviceKeyAuth()))
 	if encrypt {
 		sec, err := t.secure(tpm)
 		if err != nil {
 			return nil, err
 		}
 		defer sec.close()
-		sessions = append(sessions, sec.encrypt(encryptOut))
+		auth = sec.auth(t.deviceKeyAuth(), encryptOut)
 	}
 	rsp, err := tpm2.Hmac{
 		Handle: tpm2.AuthHandle{
 			Handle: tpm2.TPMHandle(t.deviceKeyHandle),
 			Name:   t.deviceKeyName,
-			Auth:   tpm2.PasswordAuth(nil),
+			Auth:   auth,
 		},
 		Buffer:  tpm2.TPM2BMaxBuffer{Buffer: msg},
 		HashAlg: tpm2.TPMAlgSHA256,
-	}.Execute(tpm, sessions...)
+	}.Execute(tpm)
 	if err != nil {
 		return nil, fmt.Errorf("device key HMAC err: %w", err)
 	}

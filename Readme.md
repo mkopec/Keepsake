@@ -14,11 +14,11 @@ On an authentication request, tpm-fido will attempt to load the primary key by i
 
 ### Device key
 
-Current versions add a device key: a keyed hash key with a TPM generated secret, made persistent at handle `0x8100F1D0` (change it with `-device-key-handle`), whose wrapped private area is discarded. Instead of the random seed itself, the primary key template uses an HMAC, computed with the device key, of the seed and a version byte. The version byte records whether the credential was created with `hmac-secret`, whether it is a passkey and its `credProtect` level. Because the version byte is part of the HMAC, a credential ID whose flags were modified doesn't load. (Development versions before this used a format that didn't authenticate the flags, which let a deleted passkey be used again by clearing its "passkey" flag; their credential IDs are no longer accepted.)
+Current versions add a device key: a keyed hash key with a TPM generated secret, made persistent in your slot (see [TPM objects](#tpm-objects)), with an authorization value derived from your user secret, whose wrapped private area is discarded. Instead of the random seed itself, the primary key template uses an HMAC, computed with the device key, of the seed and a version byte. The version byte records whether the credential was created with `hmac-secret`, whether it is a passkey and its `credProtect` level. Because the version byte is part of the HMAC, a credential ID whose flags were modified doesn't load. (Development versions before this used a format that didn't authenticate the flags, which let a deleted passkey be used again by clearing its "passkey" flag; their credential IDs are no longer accepted.)
 
-Because the device key can't be loaded again once it is evicted from the TPM, replacing it (`authenticatorReset`) irrecoverably invalidates every credential created with it. Key handles from versions without a device key ("legacy" key handles) keep working until the first reset; the reset sets a flag in NV index `0x0100F1D2` (`-state-index`) that disables them.
+Because the device key can't be loaded again once it is evicted from the TPM, replacing it (`authenticatorReset`) irrecoverably invalidates every credential created with it. Key handles from versions without a device key ("legacy" key handles) keep working until the first reset; the reset sets a flag in your slot's state index that disables them for you.
 
-The device key, like the credential keys, has an empty authorization value: software that can use the TPM can use it.
+Software running as you can read the user secret and so use the device key; other users can't (see [Several users](#several-users)).
 
 New key handles also set `noDA` on their keys. The keys have an empty authorization value, so dictionary attack protection doesn't protect anything, and without `noDA` the TPM refuses to use them while it is in lockout. Legacy key handles can't be used during a lockout.
 
@@ -48,9 +48,9 @@ Passkeys can be listed and deleted with tools that support credential management
 
 The PIN is set, entered and changed by the platform (browser, `fido2-token -S`, ...), as with a hardware security key. Once a PIN is set, every registration requires it (CTAP 2.0); sign-ins require it when the site asks for user verification.
 
-The PIN is stored in the TPM in NV index `0x0100F1D1` (change it with `-pin-index`):
+The PIN is stored in the TPM in your slot's PIN index (see [TPM objects](#tpm-objects)):
 
-* The index's authorization value is `LEFT(SHA-256(PIN), 16)`, the PIN hash defined by CTAP. tpm-fido checks a PIN by reading the index with that authorization value. The PIN hash is never stored on disk.
+* The index's authorization value is derived from `LEFT(SHA-256(PIN), 16)`, the PIN hash defined by CTAP, and your user secret. tpm-fido checks a PIN by reading the index with that authorization value. The PIN hash is never stored on disk.
 * The index's single byte of data is the remaining PIN retries. It is decremented before each check and reset after a correct PIN. After 8 wrong PINs the PIN is blocked; after 3 in a row tpm-fido must be restarted (the equivalent of unplugging a security key).
 * The index doesn't have `noDA` set, so every wrong PIN also counts towards the TPM's dictionary attack lockout. This limits guessing even for software that talks to the TPM directly instead of going through tpm-fido. While the TPM is in lockout, PIN checks fail with `PIN_AUTH_BLOCKED` without using up a retry. Note that the lockout is TPM-wide: wrong FIDO PINs also count towards the lockout of other DA-protected objects (for example a TPM+PIN LUKS key), and vice versa. `tpm2_getcap properties-variable` shows the TPM's `MAX_AUTH_FAIL` and `LOCKOUT_INTERVAL`.
 * The lockout only limits guessing if the TPM's lockout authorization is set (`tpm2_changeauth -c lockout`). With an empty lockout authorization, anyone who can use the TPM can reset the lockout counter (`tpm2_dictionarylockout -c`) and guess without limit. The retries counter doesn't help either: it can be rewritten with the (empty) owner authorization.
@@ -59,7 +59,7 @@ The PIN is stored in the TPM in NV index `0x0100F1D1` (change it with `-pin-inde
 Limitations:
 
 * The PIN only gates what tpm-fido does, except for credentials created with `credProtect` level 3 (see below). The keys of other credentials aren't bound to the PIN, so software running as your user can still use them through the TPM directly.
-* A blocked or forgotten PIN is removed by resetting the authenticator. Deleting only the PIN index (`tpm2_nvundefine -C o 0x0100F1D1`) also removes the PIN and keeps the existing credentials, but it destroys the UV key, so every hmac-secret secret that was derived with user verification (for example a LUKS key enrolled with `--fido2-with-client-pin=yes`) is lost.
+* A blocked or forgotten PIN is removed by resetting the authenticator. Deleting only the PIN index (`tpm2_nvundefine -C o <PIN index>`) also removes the PIN and keeps the existing credentials, but it destroys the UV key, so every hmac-secret secret that was derived with user verification (for example a LUKS key enrolled with `--fido2-with-client-pin=yes`) is lost.
 
 ### credProtect: credentials bound to the PIN
 
@@ -80,7 +80,7 @@ Commands that carry secrets (PIN hashes, hmac-secret outputs, the passkey store 
 
 Credentials created with the `hmac-secret` extension can derive secrets from salts, which is what `systemd-cryptenroll --fido2-device`, `age-plugin-fido2-hmac` and similar tools use. Each credential has two secrets (`CredRandomWithoutUV` and `CredRandomWithUV` in CTAP 2.1). tpm-fido derives them by HMACing the relying party and credential ID with one of two TPM keys:
 
-* Without user verification: the device key. It never leaves the TPM and is destroyed by a reset or when the TPM is cleared, but it has an empty authorization value, so **anyone who can use the TPM can recompute these secrets**, including someone who boots another OS on the machine. The credential ID is not secret (systemd stores it in the LUKS header).
+* Without user verification: the device key. It never leaves the TPM and is destroyed by a reset or when the TPM is cleared. Using it needs your user secret, so other users of the TPM can't compute these secrets, but **anyone who can read your files and use the TPM can**: software running as you, or someone who boots another OS on the machine while your home directory isn't encrypted. The credential ID is not secret (systemd stores it in the LUKS header).
 * With user verification (a PIN): an ordinary keyed hash key whose authorization value is the PIN hash. It is stored, wrapped by the TPM, in the PIN index. Computing these secrets requires the PIN, even with direct access to the TPM, and guessing it counts towards the TPM's dictionary attack lockout. Changing the PIN re-wraps the same key (`TPM2_ObjectChangeAuth`), so the secrets survive PIN changes.
 
 For disk encryption, enroll with a PIN:
@@ -95,7 +95,7 @@ tpm-fido keeps the PIN hash in memory while the PIN token it was issued for is v
 
 ### Signature counter
 
-The signature counter is a TPM NV counter at index `0x0100F1D0` (change it with `-counter-index`). tpm-fido defines the index on first start, which requires the owner hierarchy to have an empty authorization value. The index is an orderly (hybrid) counter, so the TPM doesn't write NV on every signature. After an unclean shutdown the counter jumps forward.
+The signature counter is a TPM NV counter in your slot. tpm-fido defines the index on first start, which requires the owner hierarchy to have an empty authorization value. The index is an orderly (hybrid) counter, so the TPM doesn't write NV on every signature. After an unclean shutdown the counter jumps forward.
 
 Older versions of tpm-fido reported the number of seconds since 2021-01-01 as the counter. The NV counter value is offset by `0x10000000` so it stays above any of those values.
 
@@ -126,67 +126,54 @@ tpm-fido asks logind (`LockedHint` and `Active` of the user's session) and GNOME
 
 ### systemd user service
 
-`contrib/systemd/tpm-fido.service` starts tpm-fido with the graphical session, restarts it if it fails, and stops it at logout:
-
-```
-go build -o ~/.local/bin/tpm-fido
-cp contrib/systemd/tpm-fido.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now tpm-fido.service
-journalctl --user -u tpm-fido -f
-```
+`make install` installs a user service that starts tpm-fido with the graphical session, restarts it if it fails, and stops it at logout. Enable it with `make enable`; logs are in `journalctl --user -u tpm-fido -f`.
 
 Stopping the service (`systemctl --user stop tpm-fido`) removes the virtual security key, for example to use only a hardware key for a while. The credentials stay in the TPM.
 
 ### Security Keys app
 
-`settings/tpm-fido-settings` is a GTK 4 / libadwaita app to set and change the PIN, list and delete passkeys, and reset the security key. It uses standard CTAP2 commands (python-fido2), so it also manages hardware security keys. It needs PyGObject, libadwaita and python-fido2 (on Arch: `python-gobject libadwaita python-fido2`).
+`settings/tpm-fido-settings` is a GTK 4 / libadwaita app to set and change the PIN, list and delete passkeys, and reset the security key. It uses standard CTAP2 commands (python-fido2), so it also manages hardware security keys. It needs PyGObject, libadwaita and python-fido2 (on Arch: `python-gobject libadwaita python-fido2`). `make install` installs it; it shows up as "Security Keys". Listing and deleting passkeys requires the PIN.
+
+## Installing
 
 ```
-mkdir -p ~/.local/bin ~/.local/share/applications
-ln -s "$PWD/settings/tpm-fido-settings" ~/.local/bin/tpm-fido-settings
-cp settings/io.github.psanford.TpmFido.Settings.desktop ~/.local/share/applications/
+make install               # as the user who will use tpm-fido; no root needed
+sudo make install-system   # once per machine, then log out and back in
+make enable                # start tpm-fido now and with every graphical login
 ```
 
-The app shows up as "Security Keys". Listing and deleting passkeys requires the PIN.
+* `make install` builds tpm-fido and installs it, the Security Keys app and the systemd user service under `~/.local` and `~/.config`. `make check-deps` reports missing dependencies and permissions.
+* `sudo make install-system` installs a udev rule that gives the user logged in at the local desktop access to `/dev/uhid` (so tpm-fido can appear as a USB security key), loads the `uhid` module at boot, and adds you (`$SUDO_USER`, or `TPM_USER=<name>`) to the `tss` group, which may use `/dev/tpmrm0`. Access to `/dev/uhid` allows creating any HID device, including keyboards; the rule limits it to the active local session. Without a local session (e.g. over SSH), use `GROUP="<a group you are in>", MODE="0660"` instead of `TAG+="uaccess"` in `/etc/udev/rules.d/70-uhid.rules`.
+* Set the TPM's lockout authorization (`tpm2_changeauth -c lockout <password>`) so the TPM's dictionary attack protection actually limits PIN guessing.
+* `make uninstall` and `sudo make uninstall-system` remove the files again. Credentials are kept: they are in the TPM and `~/.local/share/tpm-fido`.
 
-## Building
+Packagers can set `PREFIX=/usr` and `DESTDIR`. Run tpm-fido as the user, not as root.
 
-```
-# in the root directory of tpm-fido run:
-go build
-```
+### Several users
 
-## Running
+Every member of the `tss` group can use the TPM directly, and the owner hierarchy has an empty authorization value, so tpm-fido can't rely on the TPM's access control between users. Instead, each user has
 
-In order to run `tpm-fido` you will need permission to access `/dev/tpmrm0`. On Ubuntu and Arch, you can add your user to the `tss` group.
+* their own TPM objects, in a slot derived from their user ID (`-slot` chooses another; user IDs above 65535 must choose one), and
+* a random user secret in `~/.local/share/tpm-fido/user-secret`. The device key's authorization value and the PIN's authorization values in the TPM are derived from it.
 
-Your user also needs permission to access `/dev/uhid` so that `tpm-fido` can appear to be a USB device. This udev rule gives the user logged in at the local desktop access, and loading the `uhid` module at boot makes sure the rule applies:
+Every credential, the hmac-secret secrets and the passkey store depend on the device key, so another user of the TPM who can't read your user secret can't use your credentials, compute your hmac-secret secrets (e.g. LUKS keys), read your passkeys or even start guessing your PIN. tpm-fido refuses to start if the device key in its slot doesn't accept its user secret (another user's slot, or a replaced user secret file).
 
-```
-echo 'KERNEL=="uhid", SUBSYSTEM=="misc", TAG+="uaccess"' | sudo tee /etc/udev/rules.d/70-uhid.rules
-echo uhid | sudo tee /etc/modules-load.d/uhid.conf
-sudo udevadm control --reload && sudo udevadm trigger --name-match=uhid
-```
+Other users can still delete your TPM objects, which destroys your credentials but doesn't give access to them. Credentials registered with upstream tpm-fido (legacy key handles) depend only on the credential ID and aren't protected; reset the security key to retire them.
 
-The rule file must sort before `73-seat-late.rules`. Without a local session (e.g. over SSH), use `GROUP="<a group you are in>", MODE="0660"` instead of `TAG+="uaccess"`. Access to `/dev/uhid` allows creating any HID device, including keyboards, so keep it limited.
+**Don't lose `~/.local/share/tpm-fido`.** Without the user secret, none of your credentials can be used anymore. A backup only helps on the same TPM.
 
-tpm-fido creates the following TPM objects, which requires the owner hierarchy to have an empty authorization value:
+### TPM objects
+
+tpm-fido creates these TPM objects, which requires the owner hierarchy to have an empty authorization value. For slot *s* (by default your user ID):
 
 | Handle | Contents | Created |
 |---|---|---|
-| `0x0100F1D0` | signature counter | on first start |
-| `0x0100F1D1` | PIN and UV key | when a PIN is set |
-| `0x0100F1D2` | state flags | on the first reset |
-| `0x8100F1D0` | device key (persistent) | on first start |
+| `0x01300000 + 4s` | signature counter | on first start |
+| `0x01300000 + 4s + 1` | PIN and UV key | when a PIN is set |
+| `0x01300000 + 4s + 2` | state flags | on the first reset |
+| `0x81300000 + s` | device key (persistent) | on first start |
 
-To run:
-
-```
-# as a user that has permission to read and write to /dev/tpmrm0:
-./tpm-fido
-```
-Note: do not run with `sudo` or as root, as it will not work.
+For user ID 1000: `0x01300FA0`–`0x01300FA2` and `0x813003E8`. Development versions used fixed handles (`0x0100F1D0`–`0x0100F1D2`, `0x8100F1D0`) for everyone; tpm-fido mentions them at startup if they are still there.
 
 ## Dependencies
 

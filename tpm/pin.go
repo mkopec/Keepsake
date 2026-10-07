@@ -9,9 +9,6 @@ import (
 	"github.com/google/go-tpm/tpm2/transport"
 )
 
-// DefaultPINIndex is the NV index that stores the clientPIN state.
-const DefaultPINIndex = 0x0100F1D1
-
 // ErrLockout is returned when the TPM refuses to check the PIN because its
 // dictionary attack protection is in lockout mode.
 var ErrLockout = errors.New("TPM is in dictionary attack lockout")
@@ -125,6 +122,7 @@ func (t *TPM) PINSet() (bool, error) {
 // the UV key can be re-wrapped; otherwise it is nil and a new UV key is
 // created.
 func (t *TPM) SetPIN(pinHash, oldPinHash []byte, retries int) error {
+	pinHash, oldPinHash = t.pinAuth(pinHash), t.pinAuth(oldPinHash)
 	return t.withTPM(func(tpm transport.TPM) error {
 		name, exists, written, err := t.pinIndex(tpm)
 		if err != nil {
@@ -238,6 +236,7 @@ func (t *TPM) SetPINRetries(retries int) error {
 // touch the retries counter. It returns ErrLockout if the TPM is in
 // dictionary attack lockout.
 func (t *TPM) VerifyPIN(pinHash []byte) (bool, error) {
+	pinHash = t.pinAuth(pinHash)
 	var match bool
 	err := t.withTPM(func(tpm transport.TPM) error {
 		name, err := t.pinIndexWritten(tpm)

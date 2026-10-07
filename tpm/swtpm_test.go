@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -50,22 +52,22 @@ func (r *recorder) contains(secret []byte) bool {
 	return bytes.Contains(r.buf.Bytes(), secret)
 }
 
-// testHandles don't overlap with the default ones, so the test can run
-// against the swtpm used for manual testing.
-var testHandles = Handles{
-	CounterIndex: 0x0100F1E0,
-	PINIndex:     0x0100F1E1,
-	StateIndex:   0x0100F1E2,
-	DeviceKey:    0x8100F1E0,
-}
+// testSlot is far from the UIDs of real users, so tests can run against the
+// swtpm used for manual testing.
+const testSlot = 60000
 
 // swtpm returns a TPM on the swtpm socket in $TPMFIDO_SWTPM with all traffic
 // recorded, after removing what an earlier run left behind.
 func swtpm(t *testing.T) (*TPM, *recorder, Handles) {
+	return swtpmUser(t, testSlot, filepath.Join(t.TempDir(), "user-secret"))
+}
+
+func swtpmUser(t *testing.T, slot int, secretFile string) (*TPM, *recorder, Handles) {
 	sock := os.Getenv("TPMFIDO_SWTPM")
 	if sock == "" {
 		t.Skip("set TPMFIDO_SWTPM to an swtpm socket")
 	}
+	h := HandlesForSlot(slot)
 	cleanup := func() {
 		rwc, err := tpmutil.OpenTPM(sock)
 		if err != nil {
@@ -73,22 +75,22 @@ func swtpm(t *testing.T) (*TPM, *recorder, Handles) {
 		}
 		defer rwc.Close()
 		tpm := transport.FromReadWriter(rwc)
-		for _, idx := range []uint32{testHandles.CounterIndex, testHandles.PINIndex, testHandles.StateIndex} {
+		for _, idx := range []uint32{h.CounterIndex, h.PINIndex, h.StateIndex} {
 			if pub, err := (tpm2.NVReadPublic{NVIndex: tpm2.TPMHandle(idx)}).Execute(tpm); err == nil {
 				tpm2.NVUndefineSpace{AuthHandle: ownerAuth, NVIndex: tpm2.NamedHandle{Handle: tpm2.TPMHandle(idx), Name: pub.NVName}}.Execute(tpm)
 			}
 		}
-		if pub, err := (tpm2.ReadPublic{ObjectHandle: tpm2.TPMHandle(testHandles.DeviceKey)}).Execute(tpm); err == nil {
-			tpm2.EvictControl{Auth: ownerAuth, ObjectHandle: tpm2.NamedHandle{Handle: tpm2.TPMHandle(testHandles.DeviceKey), Name: pub.Name},
-				PersistentHandle: tpm2.TPMIDHPersistent(testHandles.DeviceKey)}.Execute(tpm)
+		if pub, err := (tpm2.ReadPublic{ObjectHandle: tpm2.TPMHandle(h.DeviceKey)}).Execute(tpm); err == nil {
+			tpm2.EvictControl{Auth: ownerAuth, ObjectHandle: tpm2.NamedHandle{Handle: tpm2.TPMHandle(h.DeviceKey), Name: pub.Name},
+				PersistentHandle: tpm2.TPMIDHPersistent(h.DeviceKey)}.Execute(tpm)
 		}
 	}
 	cleanup()
 	t.Cleanup(cleanup)
 
 	rec := &recorder{}
-	h := testHandles
 	h.SRKNameFile = filepath.Join(t.TempDir(), "srk-name")
+	h.UserSecretFile = secretFile
 	tp, err := newTPM(sock, h, func() (io.ReadWriteCloser, error) {
 		rwc, err := tpmutil.OpenTPM(sock)
 		return recordingConn{rwc, rec}, err
@@ -145,6 +147,8 @@ func TestSecretsNotOnBus(t *testing.T) {
 
 	for name, secret := range map[string][]byte{
 		"PIN hash": pin1, "new PIN hash": pin2,
+		"PIN auth": tp.pinAuth(pin1), "new PIN auth": tp.pinAuth(pin2),
+		"device key auth": tp.deviceKeyAuth(), "user secret": tp.userSecret,
 		"hmac-secret (UV)": uvSecret, "hmac-secret (no UV)": noUVSecret, "store key": storeKey,
 	} {
 		if rec.contains(secret) {
@@ -297,4 +301,134 @@ func TestLockoutStatus(t *testing.T) {
 	if err != nil || st.MaxAuthFail == 0 {
 		t.Fatalf("%+v %v", st, err)
 	}
+}
+
+func TestUsersIsolated(t *testing.T) {
+	alice, _, aliceHandles := swtpmUser(t, testSlot, filepath.Join(t.TempDir(), "alice"))
+	bob, _, _ := swtpmUser(t, testSlot+1, filepath.Join(t.TempDir(), "bob"))
+
+	rp := sha256.Sum256([]byte("example.com"))
+	digest := sha256.Sum256([]byte("message"))
+	pin := pinHashOf("1234")
+	if err := alice.SetPIN(pin, nil, 8); err != nil {
+		t.Fatal(err)
+	}
+	cred, _, _, err := alice.RegisterKey(rp[:], KeyOptions{HMACSecret: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, _, _, err := alice.RegisterKey(rp[:], KeyOptions{CredProtect: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Bob, in his own slot, has his own PIN and can't use Alice's credentials
+	if set, _ := bob.PINSet(); set {
+		t.Fatal("Bob sees Alice's PIN")
+	}
+	if err := bob.CheckKey(cred, rp[:]); err == nil {
+		t.Fatal("Bob accepts Alice's credential")
+	}
+
+	// tpm-fido refuses to start with Alice's slot and another secret
+	h := aliceHandles
+	h.UserSecretFile = filepath.Join(t.TempDir(), "mallory")
+	if _, err := New(os.Getenv("TPMFIDO_SWTPM"), h); err == nil {
+		t.Fatal("started with another user's device key")
+	}
+
+	// Mallory using Alice's handles directly, without her user secret
+	mallory := &TPM{
+		devicePath:      alice.devicePath,
+		counterIndex:    alice.counterIndex,
+		pinIndexHandle:  alice.pinIndexHandle,
+		stateIndex:      alice.stateIndex,
+		deviceKeyHandle: alice.deviceKeyHandle,
+		deviceKeyName:   alice.deviceKeyName,
+		srkName:         alice.srkName,
+		userSecret:      bytes.Repeat([]byte{1}, UserSecretSize),
+	}
+	if err := mallory.CheckKey(cred, rp[:]); err == nil {
+		t.Error("Mallory can load Alice's credential")
+	}
+	if _, err := mallory.SignASN1(cred, rp[:], digest[:], nil); err == nil {
+		t.Error("Mallory can sign with Alice's credential")
+	}
+	if _, err := mallory.SignASN1(bound, rp[:], digest[:], pin); err == nil {
+		t.Error("Mallory can sign with Alice's PIN-bound credential, even knowing the PIN")
+	}
+	if _, err := mallory.HMACSecret(cred, rp[:], nil); err == nil {
+		t.Error("Mallory can compute Alice's hmac-secret")
+	}
+	if _, err := mallory.StoreKey(); err == nil {
+		t.Error("Mallory can compute Alice's passkey store key")
+	}
+	if ok, _ := mallory.VerifyPIN(pin); ok {
+		t.Error("Mallory can check Alice's PIN")
+	}
+
+	// Alice is unaffected
+	if _, err := alice.SignASN1(cred, rp[:], digest[:], nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := alice.SignASN1(bound, rp[:], digest[:], pin); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// go-tpm can't use HMAC session authorization values containing zero
+// bytes; derived ones must work for any user secret. (Before they were hex
+// encoded, about 12% of user secrets failed.)
+func TestDerivedAuthAnySecret(t *testing.T) {
+	tp, _, _ := swtpm(t)
+	rp := sha256.Sum256([]byte("example.com"))
+	d := sha256.Sum256([]byte("m"))
+	for i := 0; i < 48; i++ {
+		tp.userSecret = mustRand(UserSecretSize)
+		pin := pinHashOf(fmt.Sprint(i))
+		err := tp.withTPM(func(tpm transport.TPM) error {
+			tpm2.EvictControl{Auth: ownerAuth, ObjectHandle: tpm2.NamedHandle{Handle: tpm2.TPMHandle(tp.deviceKeyHandle), Name: tp.deviceKeyName},
+				PersistentHandle: tpm2.TPMIDHPersistent(tp.deviceKeyHandle)}.Execute(tpm)
+			return tp.createDeviceKey(tpm)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tp.SetPIN(pin, nil, 8); err != nil {
+			t.Fatal(err)
+		}
+		kh, _, _, err := tp.RegisterKey(rp[:], KeyOptions{CredProtect: 3, HMACSecret: true})
+		if err != nil {
+			t.Fatalf("secret %x: %v", tp.userSecret, err)
+		}
+		if ok, err := tp.VerifyPIN(pin); !ok || err != nil {
+			t.Fatalf("secret %x: verify PIN: %v %v", tp.userSecret, ok, err)
+		}
+		if _, err := tp.SignASN1(kh, rp[:], d[:], pin); err != nil {
+			t.Fatalf("secret %x: %v", tp.userSecret, err)
+		}
+		if _, err := tp.HMACSecret(kh, rp[:], nil); err != nil {
+			t.Fatalf("secret %x: %v", tp.userSecret, err)
+		}
+	}
+}
+
+func TestDeriveNoZeroBytes(t *testing.T) {
+	tp := &TPM{}
+	for i := 0; i < 1000; i++ {
+		tp.userSecret = mustRand(UserSecretSize)
+		for _, v := range [][]byte{tp.deviceKeyAuth(), tp.pinAuth(mustRand(16))} {
+			if len(v) != 32 || bytes.IndexByte(v, 0) >= 0 {
+				t.Fatalf("bad auth value %x", v)
+			}
+		}
+	}
+}
+
+func hmacSHA256(key []byte, data ...[]byte) []byte {
+	m := hmac.New(sha256.New, key)
+	for _, d := range data {
+		m.Write(d)
+	}
+	return m.Sum(nil)
 }

@@ -167,6 +167,7 @@ func changeUVKeyAuth(sec *secure, blob, oldPinHash, newPinHash []byte) ([]byte, 
 // with hmac-secret, and ErrLockout if the TPM refuses the PIN hash because
 // it is in dictionary attack lockout.
 func (t *TPM) HMACSecret(keyHandle, rpIDHash, uvPinHash []byte) ([]byte, error) {
+	uvPinHash = t.pinAuth(uvPinHash)
 	flags, err := keyHandleInfo(keyHandle)
 	if err != nil {
 		return nil, err
